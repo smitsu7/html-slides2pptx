@@ -454,7 +454,7 @@ def parse_length(value: Optional[str], reference: Optional[float] = None) -> Opt
     s = value.strip()
     if not s or s in {"auto", "initial", "inherit"}:
         return None
-    if s.endswith("px"):
+    if .endswith("px"):
         return float(s[:-2])
     if s.endswith("%") and reference is not None:
         try:
