@@ -19,10 +19,10 @@ The focus is on recreating text, shapes, tables, charts, and images as native Po
 - [pillow](https://pillow.readthedocs.io/)
 - [playwright](https://playwright.dev/python/) (for the browser engine)
 
-Install dependencies:
+Install dependencies using `requirements.txt`:
 
 ```bash
-pip install beautifulsoup4 python-pptx pillow playwright
+pip install -r requirements.txt
 playwright install chromium
 ```
 
