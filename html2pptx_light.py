@@ -23,8 +23,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from pptx import Presentation
@@ -40,11 +39,6 @@ try:
 except ImportError:
     Image = None
     ImageColor = None
-
-try:
-    import requests
-except ImportError:
-    requests = None
 
 # Slide canvas size used internally (px). Actual PPTX is scaled proportionally.
 SLIDE_REF_WIDTH = 1920
@@ -67,7 +61,6 @@ TAG_FONT_SIZE = {
 }
 
 CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
-IMPORT_RULE_RE = re.compile(r"@import\s+(?:url\()?['\"]?([^'\";)]+)['\"]?\)?[^;]*;", re.I)
 SIMPLE_SELECTOR_TOKEN_RE = re.compile(r"([#.]?[\w-]+|\*)")
 WHITESPACE_RE = re.compile(r"\s+")
 GRID_REPEAT_RE = re.compile(r"repeat\((\d+),\s*([^)]+)\)")
@@ -419,20 +412,10 @@ def css_color_to_rgb_tuple(color_str: Optional[str]) -> Optional[Tuple[int, int,
                 return (r, g, b)
             if len(s) == 7:
                 return (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
-        lowered = s.lower()
-        if lowered.startswith("rgba") or lowered.startswith("rgb"):
-            inner = s[s.find("(") + 1 : s.rfind(")")]
-            cleaned = inner.replace("/", " ")
-            parts = [p for p in re.split(r"[\s,]+", cleaned) if p]
-            if len(parts) >= 3:
-                channels = []
-                for raw in parts[:3]:
-                    raw = raw.strip()
-                    if raw.endswith("%"):
-                        channels.append(int(round(float(raw[:-1]) * 2.55)))
-                    else:
-                        channels.append(int(float(raw)))
-                return tuple(max(0, min(255, c)) for c in channels)  # type: ignore
+        if s.lower().startswith("rgb"):
+            nums = s[s.find("(") + 1 : s.find(")")].split(",")
+            r, g, b = [int(float(v.strip())) for v in nums[:3]]
+            return (r, g, b)
     except Exception:
         return None
     keyword = CSS_COLOR_KEYWORDS.get(s.lower())
@@ -444,32 +427,6 @@ def css_color_to_rgb_tuple(color_str: Optional[str]) -> Optional[Tuple[int, int,
         except Exception:
             return None
     return None
-
-
-def extract_background_color(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    text = value.strip()
-    if not text or text.lower() in {"none", "transparent"}:
-        return None
-    hex_match = re.search(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", text)
-    if hex_match:
-        return hex_match.group(0)
-    func_match = re.search(r"rgba?\([^\)]+\)", text, re.I)
-    if func_match:
-        return func_match.group(0)
-    tokens = re.split(r"\s+", text)
-    for token in tokens:
-        if css_color_to_rgb_tuple(token):
-            return token
-    return None
-
-
-def background_from_style(style: Dict[str, str]) -> Optional[str]:
-    bg_color = style.get("background-color")
-    if bg_color:
-        return bg_color
-    return extract_background_color(style.get("background"))
 
 
 def css_is_transparent(color_str: Optional[str]) -> bool:
@@ -497,7 +454,7 @@ def parse_length(value: Optional[str], reference: Optional[float] = None) -> Opt
     s = value.strip()
     if not s or s in {"auto", "initial", "inherit"}:
         return None
-    if s.endswith("px"):
+    if .endswith("px"):
         return float(s[:-2])
     if s.endswith("%") and reference is not None:
         try:
@@ -584,38 +541,13 @@ def parse_simple_selector(selector: str) -> Optional[StyleRule]:
 class StyleResolver:
     """Very small CSS resolver (supports tag/id/class selectors without combinators)."""
 
-    def __init__(self, soup: BeautifulSoup, base_dir: Optional[Path] = None, html_path: Optional[Path] = None):
+    def __init__(self, soup: BeautifulSoup):
         self.rules: List[StyleRule] = []
-        self.base_dir = Path(base_dir or Path.cwd()).resolve()
-        self.html_path = html_path.resolve() if html_path else None
-        self._loaded_sources: Set[str] = set()
-        inline_origin = str(self.html_path.parent if self.html_path else self.base_dir)
         for style_tag in soup.select("style"):
-            css_text = style_tag.string or ""
-            self._consume_stylesheet(css_text, origin=inline_origin)
-        for link_tag in soup.find_all("link"):
-            rel_attr = link_tag.get("rel")
-            if isinstance(rel_attr, str):
-                rel_values = [rel_attr.lower()]
-            else:
-                rel_values = [val.lower() for val in (rel_attr or [])]
-            if "stylesheet" not in rel_values:
-                continue
-            href = link_tag.get("href")
-            loaded = self._load_external_stylesheet(href, origin=inline_origin)
-            if loaded:
-                css_text, resolved_origin = loaded
-                self._consume_stylesheet(css_text, origin=resolved_origin)
+            self._consume_stylesheet(style_tag.string or "")
 
-    def _consume_stylesheet(self, css_text: str, origin: Optional[str] = None) -> None:
-        if not css_text:
-            return
-        for match in IMPORT_RULE_RE.findall(css_text):
-            loaded = self._load_external_stylesheet(match, origin=origin)
-            if loaded:
-                import_text, import_origin = loaded
-                self._consume_stylesheet(import_text, origin=import_origin)
-        cleaned = IMPORT_RULE_RE.sub("", CSS_COMMENT_RE.sub("", css_text))
+    def _consume_stylesheet(self, css_text: str) -> None:
+        cleaned = CSS_COMMENT_RE.sub("", css_text)
         for raw_rule in cleaned.split("}"):
             if "{" not in raw_rule:
                 continue
@@ -629,53 +561,6 @@ class StyleResolver:
                     continue
                 rule.declarations = declarations.copy()
                 self.rules.append(rule)
-
-    def _load_external_stylesheet(self, href: Optional[str], origin: Optional[str]) -> Optional[Tuple[str, str]]:
-        resolved = self._resolve_href(href, origin)
-        if not resolved or resolved in self._loaded_sources:
-            return None
-        self._loaded_sources.add(resolved)
-        parsed = urlparse(resolved)
-        if parsed.scheme in {"http", "https"}:
-            if not requests:
-                return None
-            try:
-                resp = requests.get(resolved, timeout=10)
-                resp.raise_for_status()
-            except Exception:
-                return None
-            return resp.text, resolved
-        path = Path(resolved)
-        if not path.exists():
-            return None
-        try:
-            return path.read_text(encoding="utf-8"), str(path)
-        except UnicodeDecodeError:
-            return path.read_text(encoding="utf-8", errors="ignore"), str(path)
-
-    def _resolve_href(self, href: Optional[str], origin: Optional[str]) -> Optional[str]:
-        if not href:
-            return None
-        href = href.strip()
-        if not href:
-            return None
-        parsed = urlparse(href)
-        if parsed.scheme in {"http", "https"}:
-            return href
-        if parsed.scheme == "data":
-            return None
-        if parsed.scheme == "file":
-            return parsed.path
-        if origin and urlparse(origin).scheme in {"http", "https"}:
-            base = origin if origin.endswith("/") else origin + "/"
-            return urljoin(base, href)
-        if origin:
-            base_path = Path(origin)
-            if not base_path.exists() or base_path.is_file():
-                base_path = base_path.parent
-        else:
-            base_path = self.base_dir
-        return str((base_path / href).resolve())
 
     def get_style(self, element: Tag) -> Dict[str, str]:
         tag = (element.name or "").lower()
@@ -841,7 +726,7 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
 
 
 def detect_shape_style(style: Dict[str, str]) -> Dict[str, Any]:
-    fill_color = background_from_style(style)
+    fill_color = style.get("background-color") or style.get("background")
     border_value = style.get("border", "")
     border_width = parse_length(style.get("border-width"))
     border_color = style.get("border-color")
@@ -954,7 +839,7 @@ def extract_blocks(
                     row_cells.append(
                         TableCell(
                             text=cell_text,
-                            background_color=background_from_style(cell_style),
+                            background_color=cell_style.get("background-color") or cell_style.get("background"),
                             border_color=cell_style.get("border-color"),
                             border_width=parse_length(cell_style.get("border-width")),
                             text_style=cell_text_style,
@@ -991,7 +876,7 @@ def extract_blocks(
         elif tag == "hr":
             block = Block(
                 kind="shape",
-                shape_style={"fill_color": background_from_style(style) or "#999999"},
+                shape_style={"fill_color": style.get("background-color") or "#999999"},
                 layout=layout,
             )
 
@@ -1192,7 +1077,7 @@ def parse_html_static(input_html: str, selector: Optional[str] = None) -> List[S
     base_dir = path.parent
     with path.open("r", encoding="utf-8") as f:
         soup = BeautifulSoup(f, "html.parser")
-    resolver = StyleResolver(soup, base_dir=base_dir, html_path=path)
+    resolver = StyleResolver(soup)
     if selector:
         slide_candidates = soup.select(selector)
     else:
@@ -1207,7 +1092,7 @@ def parse_html_static(input_html: str, selector: Optional[str] = None) -> List[S
     slides: List[SlideModel] = []
     for idx, slide_el in enumerate(slide_candidates):
         style = resolver.get_style(slide_el)
-        background = background_from_style(style)
+        background = style.get("background-color") or style.get("background")
         title_el = slide_el.find(["h1", "h2", "h3", "h4"])
         title = title_el.get_text(" ", strip=True) if title_el else None
         constraints_map: Dict[int, LayoutConstraint] = {}
