@@ -34,22 +34,44 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Constants ---
-SLIDE_WIDTH_PX = 1920
-SLIDE_HEIGHT_PX = 1080
+SLIDE_WIDTH_PX = 1280
+SLIDE_HEIGHT_PX = 720
+PPTX_WIDTH_INCHES = 13.333 # This should be updated too? 1280/96 = 13.333. 720/96 = 7.5.
+# 1920/96 = 20. 1080/96 = 11.25.
+# So 13.333 x 7.5 IS 1280x720.
+# Wait, 1280 / 96 = 13.3333.
+# 720 / 96 = 7.5.
+# So the previous constants were inconsistent?
+# SLIDE_WIDTH_PX = 1920 was paired with PPTX_WIDTH_INCHES = 13.333?
+# If so, px_to_inches(1920) = 20 inches.
+# But PPTX_WIDTH_INCHES was 13.333.
+# Let's check the file content again.
+# Line 37: SLIDE_WIDTH_PX = 1920
+# Line 39: PPTX_WIDTH_INCHES = 13.333
+# This implies the script was scaling?
+# Or `PPTX_WIDTH_INCHES` is just a default for something else?
+# `PPTXBuilder` uses `self.prs.slide_width = px_to_inches(SLIDE_WIDTH_PX)`.
+# So it sets slide width to 20 inches.
+# But `PPTX_WIDTH_INCHES` constant is unused?
+# I'll update SLIDE_WIDTH_PX to 1280 and SLIDE_HEIGHT_PX to 720.
+
+SLIDE_WIDTH_PX = 1280
+SLIDE_HEIGHT_PX = 720
 PPTX_WIDTH_INCHES = 13.333
 PPTX_HEIGHT_INCHES = 7.5
 
-# Conversion factor: 1 inch = 96 px (standard web DPI)
-PX_TO_INCH = 1 / 96.0
-
-def px_to_inches(px: float) -> Inches:
-    return Inches(px * PX_TO_INCH)
-
-# --- Data Structures ---
+# ...
 
 @dataclass
 class Style:
     display: str = "block"
+    # ...
+    # Positioning
+    top: Optional[float] = None
+    left: Optional[float] = None
+    right: Optional[float] = None
+    bottom: Optional[float] = None
+    z_index: int = 0
     position: str = "static"
     width: Optional[float] = None # Explicit width
     height: Optional[float] = None # Explicit height
@@ -82,6 +104,12 @@ class Style:
     
     # Grid
     grid_template_columns: List[str] = field(default_factory=list) # e.g. ['100px', '1fr']
+    
+    # Positioning
+    top: Optional[float] = None
+    left: Optional[float] = None
+    right: Optional[float] = None
+    bottom: Optional[float] = None
 
 @dataclass
 class RenderBox:
@@ -187,6 +215,7 @@ class TextMeasurer:
         line_height_bbox = self.draw.textbbox((0, 0), "Ag", font=font)
         line_height = (line_height_bbox[3] - line_height_bbox[1]) * 1.2
         total_height = len(lines) * line_height
+        print(f"DEBUG: TextMeasurer - Text: {text[:20]}..., Width: {max_width}, Lines: {len(lines)}, TotalH: {total_height}")
         
         return lines, max_line_width, total_height
 
@@ -411,6 +440,16 @@ class StyleParser:
             # Simple parser: split by space
             s.grid_template_columns = props['grid-template-columns'].split()
 
+        # Positioning
+        if 'top' in props: s.top = parse_len(props['top'])
+        if 'left' in props: s.left = parse_len(props['left'])
+        if 'right' in props: s.right = parse_len(props['right'])
+        if 'bottom' in props: s.bottom = parse_len(props['bottom'])
+        
+        if 'z-index' in props:
+            try: s.z_index = int(props['z-index'])
+            except: s.z_index = 0
+
         return s
         
     def _apply_tailwind_polyfill(self, element: Tag, style_props: Dict[str, str]):
@@ -584,6 +623,8 @@ class LayoutEngine:
             col_x_offsets.append(curr_x)
             curr_x += w
             
+        print(f"DEBUG: Grid Layout - StartX: {start_x}, StartY: {start_y}, ColWidths: {col_widths}, Offsets: {col_x_offsets}")
+
         children = [c for c in element.children if isinstance(c, Tag) and c.name not in ['script', 'style', 'noscript', 'meta', 'link', 'head', 'title']]
         
         for i, child in enumerate(children):
@@ -619,15 +660,14 @@ class LayoutEngine:
             self._layout_container_children(child, child_box, style_parser, child_inner_x, child_inner_y, child_content_width)
             
             # Update child height
-            child_box.content_height = max(child_box.content_height, child_style.height) if child_style.height > 0 else child_box.content_height
-            # child_box.total_height is auto-calculated
+            child_box.content_height = max(child_box.content_height, child_style.height) if (child_style.height and child_style.height > 0) else child_box.content_height
             
             box.children.append(child_box)
             row_max_height = max(row_max_height, child_box.total_height + child_style.margin_top + child_style.margin_bottom)
+            print(f"DEBUG: Grid Child {i} - Col: {col_idx}, X: {child_box.x}, Y: {child_box.y}, W: {child_box.content_width}, H: {child_box.content_height}, TotalH: {child_box.total_height}")
         
         # Update total height
         box.content_height = (current_row_y + row_max_height) - start_y
-        # box.total_height is auto-calculated
 
     def _layout_block_children(self, element: Tag, box: RenderBox, style_parser: StyleParser, start_x: float, start_y: float, available_width: float):
         """Lays out children in a vertical block."""
@@ -673,6 +713,74 @@ class LayoutEngine:
                 
             # Element node
             style = style_parser.compute_style(child)
+            
+            # Absolute Positioning Handling
+            if style.position == 'absolute':
+                # Calculate dimensions (simplified)
+                if style.width and style.width > 0:
+                    child_width = style.width
+                else:
+                    child_width = available_width # Default to full width? Or auto?
+                
+                # Calculate Position (Relative to parent box)
+                # Note: Ideally relative to nearest positioned ancestor, but we use parent for simplicity
+                abs_x = box.x + (style.left if style.left is not None else style.padding_left) # Default to padding? No, default to static pos?
+                # If left is None, it should be at static position (start_x).
+                if style.left is not None:
+                    abs_x = box.x + style.left
+                elif style.right is not None:
+                    abs_x = box.x + box.content_width - style.right - child_width
+                else:
+                    abs_x = start_x # Static position
+                    
+                abs_y = box.y + (style.top if style.top is not None else style.padding_top)
+                if style.top is not None:
+                    abs_y = box.y + style.top
+                elif style.bottom is not None:
+                    # We need height for bottom. 
+                    # If height is auto, this is hard.
+                    # Assume top=static if not set.
+                    abs_y = current_y
+                else:
+                    abs_y = current_y # Static position
+
+                child_box = RenderBox(
+                    element=child,
+                    box_type="block",
+                    style=style,
+                    x=abs_x,
+                    y=abs_y,
+                    content_width=child_width,
+                    content_height=0
+                )
+                
+                if child.name == 'img':
+                    child_box.box_type = "image"
+                    w, h, data = self._measure_image(child, child_width)
+                    child_box.content_width = w
+                    child_box.content_height = h
+                    child_box.image_data = data
+                elif child.name == 'canvas':
+                    child_box.box_type = "chart_placeholder"
+                    child_box.content_height = 400 if (not style.height or style.height == 0) else style.height
+                else:
+                    # Recurse
+                    child_inner_x = child_box.x + style.padding_left + style.border_width
+                    child_inner_y = child_box.y + style.padding_top + style.border_width
+                    self._layout_container_children(child, child_box, style_parser, child_inner_x, child_inner_y, child_box.content_width)
+                    
+                    if style.height and style.height > 0:
+                        child_box.content_height = style.height
+                    else:
+                        # Calc height from children
+                        max_child_y = child_inner_y
+                        for c in child_box.children:
+                             max_child_y = max(max_child_y, c.y + c.total_height)
+                        child_box.content_height = max_child_y - child_inner_y
+
+                box.children.append(child_box)
+                print(f"DEBUG: Absolute Child - Y: {child_box.y}, H: {child_box.content_height}")
+                continue # Do not update current_y
             
             # Special handling for Slide Container (Fix "White Square" offset)
             is_slide_root = False
@@ -730,15 +838,13 @@ class LayoutEngine:
                 child_box.content_width = w
                 child_box.content_height = h
                 child_box.image_data = data
-                # child_box.total_height is auto-calculated
             elif child.name == 'table':
                 child_box.box_type = "table"
                 self._measure_table(child, child_box, style_parser)
             elif child.name == 'canvas':
                 child_box.box_type = "chart_placeholder"
                 # Default size for chart
-                child_box.content_height = 400 if style.height == 0 else style.height
-                # child_box.total_height is auto-calculated
+                child_box.content_height = 400 if (not style.height or style.height == 0) else style.height
             else:
                 # Recurse
                 child_inner_x = child_box.x + style.padding_left + style.border_width
@@ -754,10 +860,9 @@ class LayoutEngine:
                     for c in child_box.children:
                         max_child_y = max(max_child_y, c.y + c.total_height)
                     child_box.content_height = max_child_y - child_inner_y
-                
-                # child_box.total_height is auto-calculated
 
             box.children.append(child_box)
+            print(f"DEBUG: Block Child - Type: {child_box.box_type}, Y: {child_box.y}, H: {child_box.content_height}, TotalH: {child_box.total_height}")
             
             # Pagination Check (only for top-level elements of the page root)
             if box == self.current_page_root:
@@ -793,7 +898,6 @@ class LayoutEngine:
             
         # Update parent height
         box.content_height = current_y - start_y
-        # box.total_height is auto-calculated
 
     def _layout_flex_children(self, element: Tag, parent_box: RenderBox, style_parser: StyleParser, start_x: float, start_y: float, available_width: float):
         # Simple Flex Row implementation
@@ -832,16 +936,30 @@ class LayoutEngine:
                 box.chart_id = child.get('id')
             else:
                  if list(child.children):
-                    self._layout_container_children(child, box, style_parser, box.content_width)
-                    children_height = sum([c.outer_height for c in box.children])
-                    box.content_height = max(box.content_height, children_height)
-            
-            if style.height: box.content_height = style.height
+                    # Recurse
+                    child_inner_x = box.x + style.padding_left + style.border_width # Wait, box.x is not set yet
+                    # We need to set box.x first
+                    pass
+
+            if style.height and style.height > 0: box.content_height = style.height
             
             # Position
-            box.x = parent_box.x + parent_box.style.padding_left + parent_box.style.border_width + current_x + style.margin_left
-            box.y = parent_box.y + parent_box.style.padding_top + parent_box.style.border_width + style.margin_top
+            box.x = current_x + style.margin_left
+            box.y = start_y + style.margin_top
             
+            # Recurse now that we have position
+            if child.name not in ['img', 'canvas'] and list(child.children):
+                 child_inner_x = box.x + style.padding_left + style.border_width
+                 child_inner_y = box.y + style.padding_top + style.border_width
+                 self._layout_container_children(child, box, style_parser, child_inner_x, child_inner_y, box.content_width)
+                 # Update height based on children
+                 children_height = sum([c.outer_height for c in box.children]) # This is wrong for block layout inside flex
+                 # If we use _layout_container_children, it populates box.children and sets box.content_height?
+                 # No, _layout_container_children sets box.content_height for block/grid, but for flex?
+                 # _layout_block_children sets box.content_height.
+                 # So we don't need to sum children here if we called _layout_container_children.
+                 pass
+
             parent_box.children.append(box)
             
             current_x += col_width
@@ -1015,7 +1133,9 @@ class PPTXBuilder:
                 fill.fore_color.rgb = RGBColor(*page_box.style.background_color)
             
             # Draw children
-            for child in page_box.children:
+            # Sort by z-index
+            sorted_children = sorted(page_box.children, key=lambda c: c.style.z_index)
+            for child in sorted_children:
                 self._draw_box(slide, child, slide_index=i)
 
     def _draw_box(self, slide, box: RenderBox, slide_index: int):
