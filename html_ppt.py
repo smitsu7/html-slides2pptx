@@ -97,7 +97,7 @@ FONT_MAPPING = {
     "yu gothic ui": "Yu Gothic UI",
     "yu gothic": "Yu Gothic",
     "meiryo": "Meiryo",
-    "aptos": "Calibri",
+    "aptos": "Aptos",
     "inter": "Calibri",
 }
 
@@ -140,11 +140,7 @@ BROWSER_COLLECT_JS = """
         prev.fontSizePx === run.fontSizePx &&
         prev.fontWeight === run.fontWeight &&
         prev.fontStyle === run.fontStyle &&
-        prev.color === run.color &&
-        prev.fontFamily === run.fontFamily &&
-        prev.lineHeight === run.lineHeight &&
-        prev.letterSpacing === run.letterSpacing &&
-        prev.textTransform === run.textTransform
+        prev.color === run.color
       ) {
         prev.text += run.text;
       } else {
@@ -1397,7 +1393,6 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                         bold=current_style.get("bold"),
                         italic=current_style.get("italic"),
                         color=current_style.get("color"),
-                        font_family=current_style.get("font_family"),
                     )
                 )
             return
@@ -1411,7 +1406,6 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                     bold=current_style.get("bold"),
                     italic=current_style.get("italic"),
                     color=current_style.get("color"),
-                    font_family=current_style.get("font_family"),
                 )
             )
             return
@@ -1432,7 +1426,6 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                     bold=base_style.get("bold"),
                     italic=base_style.get("italic"),
                     color=base_style.get("color"),
-                    font_family=base_style.get("font_family"),
                 )
             )
     return merge_runs(runs)
@@ -1594,7 +1587,6 @@ def extract_blocks(
             )
 
         if block:
-            block.position = style.get("position")
             block.z_index = parse_z_index(style)
             block.order = order_counter
             order_counter += 1
@@ -1629,21 +1621,15 @@ def assign_fallback_layouts(slides: List[SlideModel]) -> None:
         slide_width = slide.canvas_width or SLIDE_REF_WIDTH
         flow_y = DEFAULT_PADDING_Y
         for block in slide.blocks:
-            position = (block.position or "").lower() if block.position else ""
-            is_absolute = position in {"absolute", "fixed"}
             if block.layout.left is None:
                 block.layout.left = DEFAULT_PADDING_X
             if block.layout.width is None:
                 block.layout.width = max(slide_width - 2 * DEFAULT_PADDING_X, 200.0)
             block_height = block.layout.height or estimate_block_height(block)
+            if block.layout.top is None:
+                block.layout.top = flow_y
             block.layout.height = block_height
-            if not is_absolute:
-                if block.layout.top is None:
-                    block.layout.top = flow_y
-                flow_y = max(flow_y, block.layout.top + block.layout.height + FLOW_GAP)
-            else:
-                if block.layout.top is None:
-                    block.layout.top = DEFAULT_PADDING_Y
+            flow_y = max(flow_y, block.layout.top + block.layout.height + FLOW_GAP)
 
 
 def apply_layout_constraints(slides: List[SlideModel]) -> None:
@@ -1853,7 +1839,6 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
     block = Block(kind=kind or "text", layout=layout)
     block.z_index = int(block_info.get("zIndex", 0) or 0)
     block.order = int(block_info.get("order", 0) or 0)
-    block.position = block_info.get("position")
     styles = block_info.get("styles") or {}
     align = (styles.get("textAlign") or "").lower() if styles.get("textAlign") else None
     if kind == "text":
@@ -1864,10 +1849,6 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         base_bold = css_weight_is_bold(styles.get("fontWeight"))
         base_italic = (styles.get("fontStyle") or "").lower() == "italic"
         base_color = styles.get("color")
-        base_font_family = styles.get("fontFamily")
-        base_line_height = parse_line_height(styles.get("lineHeight"), base_font_size)
-        base_letter_spacing = styles.get("letterSpacing")
-        base_text_transform = styles.get("textTransform")
         block.text = text
         block.text_style = {
             "font_size": base_font_size,
@@ -1875,13 +1856,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             "italic": base_italic,
             "color": base_color,
             "align": align,
-            "font_family": base_font_family,
-            "line_height": base_line_height,
         }
-        if base_letter_spacing:
-            block.text_style["letter_spacing"] = base_letter_spacing
-        if base_text_transform:
-            block.text_style["text_transform"] = base_text_transform
         run_entries = block_info.get("runs") or []
         runs: List[TextRun] = []
         for entry in run_entries:
@@ -1894,7 +1869,6 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                 (entry.get("fontStyle") or "").lower() == "italic" if entry.get("fontStyle") else base_italic
             )
             run_color = entry.get("color") or base_color
-            run_font_family = entry.get("fontFamily") or base_font_family
             runs.append(
                 TextRun(
                     text=segment,
@@ -1902,21 +1876,13 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                     bold=run_bold,
                     italic=run_italic,
                     color=run_color,
-                    font_family=run_font_family,
                 )
             )
         if runs:
             block.runs = runs
         else:
             block.runs = [
-                TextRun(
-                    text=text,
-                    font_size=base_font_size,
-                    bold=base_bold,
-                    italic=base_italic,
-                    color=base_color,
-                    font_family=base_font_family,
-                )
+                TextRun(text=text, font_size=base_font_size, bold=base_bold, italic=base_italic, color=base_color)
             ]
     elif kind == "list":
         items = block_info.get("items") or []
@@ -1932,10 +1898,6 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             elif fw_str in {"bold", "bolder"}:
                 bold = True
         color = styles.get("color")
-        font_family = styles.get("fontFamily")
-        line_height = parse_line_height(styles.get("lineHeight"), font_size)
-        letter_spacing = styles.get("letterSpacing")
-        text_transform = styles.get("textTransform")
         block.items = items
         block.numbered = bool(block_info.get("ordered"))
         block.text_style = {
@@ -1943,13 +1905,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             "bold": bold,
             "color": color,
             "align": align,
-            "font_family": font_family,
-            "line_height": line_height,
         }
-        if letter_spacing:
-            block.text_style["letter_spacing"] = letter_spacing
-        if text_transform:
-            block.text_style["text_transform"] = text_transform
     elif kind == "table":
         rows = block_info.get("rows") or []
         if not rows:
@@ -1958,13 +1914,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         block.text_style = {
             "font_size": float(styles.get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7),
             "color": styles.get("color"),
-            "font_family": styles.get("fontFamily"),
-            "line_height": parse_line_height(styles.get("lineHeight"), float(styles.get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7)),
         }
-        if styles.get("letterSpacing"):
-            block.text_style["letter_spacing"] = styles.get("letterSpacing")
-        if styles.get("textTransform"):
-            block.text_style["text_transform"] = styles.get("textTransform")
         row_cells_info = block_info.get("rowCells") or []
         table_cells: List[List[TableCell]] = []
         for row in row_cells_info:
@@ -1976,16 +1926,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                     "bold": css_weight_is_bold(cell_styles.get("fontWeight")),
                     "color": cell_styles.get("color"),
                     "align": (cell_styles.get("textAlign") or "").lower() or None,
-                    "font_family": cell_styles.get("fontFamily"),
-                    "line_height": parse_line_height(
-                        cell_styles.get("lineHeight"),
-                        float(cell_styles.get("fontSizePx") or block.text_style["font_size"]),
-                    ),
                 }
-                if cell_styles.get("letterSpacing"):
-                    text_style["letter_spacing"] = cell_styles.get("letterSpacing")
-                if cell_styles.get("textTransform"):
-                    text_style["text_transform"] = cell_styles.get("textTransform")
                 cell_objs.append(
                     TableCell(
                         text=cell_info.get("text", ""),
@@ -2139,15 +2080,6 @@ def apply_paragraph_alignment(paragraph, align: Optional[str]) -> None:
     paragraph.alignment = align_map.get(align, PP_ALIGN.LEFT)
 
 
-def apply_paragraph_line_height(paragraph, line_height: Optional[float], font_size: Optional[float]) -> None:
-    if not line_height or not font_size or font_size <= 0:
-        return
-    try:
-        paragraph.line_spacing = float(line_height) / float(font_size)
-    except Exception:
-        return
-
-
 def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
     left = position_to_emu(block.layout.left or DEFAULT_PADDING_X, "x", prs, slide_model)
     top = position_to_emu(block.layout.top or DEFAULT_PADDING_Y, "y", prs, slide_model)
@@ -2159,7 +2091,6 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
     tf.word_wrap = True
     tf.clear()
     base_style = block.text_style or {}
-    line_height_px = base_style.get("line_height")
     runs = block.runs or [
         TextRun(
             text=block.text,
@@ -2167,19 +2098,16 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             bold=base_style.get("bold"),
             italic=base_style.get("italic"),
             color=base_style.get("color"),
-            font_family=base_style.get("font_family"),
         )
     ]
     paragraph = tf.paragraphs[0]
     apply_paragraph_alignment(paragraph, base_style.get("align"))
-    apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
     for run in runs:
         pieces = run.text.split("\n")
         for idx, piece in enumerate(pieces):
             if idx > 0:
                 paragraph = tf.add_paragraph()
                 apply_paragraph_alignment(paragraph, base_style.get("align"))
-                apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
             ppt_run = paragraph.add_run()
             ppt_run.text = piece
             font = ppt_run.font
@@ -2191,12 +2119,6 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             rgb = css_color_to_rgb_tuple(color)
             if rgb:
                 font.color.rgb = RGBColor(*rgb)
-            mapped_family = map_font_family(run.font_family or base_style.get("font_family"))
-            if mapped_family:
-                font.name = mapped_family
-            elif run.font_family or base_style.get("font_family"):
-                font.name = (run.font_family or base_style.get("font_family"))
-            apply_paragraph_line_height(paragraph, line_height_px, size)
     if block.shape_style:
         shape_style = block.shape_style
         fill_color = css_color_to_rgb_tuple(shape_style.get("fill_color"))
@@ -2229,7 +2151,6 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
     tf.word_wrap = True
     tf.clear()
     base_style = block.text_style or {}
-    line_height_px = base_style.get("line_height")
     for idx, item in enumerate(block.items):
         paragraph = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         text = item.strip()
@@ -2237,7 +2158,6 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             text = f"{idx + 1}. {text}"
         paragraph.text = text
         apply_paragraph_alignment(paragraph, base_style.get("align"))
-        apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
         font = paragraph.font
         size = base_style.get("font_size", DEFAULT_FONT_SIZE)
         font.size = Pt(px_to_pt(size))
@@ -2248,11 +2168,6 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
         rgb = css_color_to_rgb_tuple(base_style.get("color"))
         if rgb:
             font.color.rgb = RGBColor(*rgb)
-        mapped_family = map_font_family(base_style.get("font_family"))
-        if mapped_family:
-            font.name = mapped_family
-        elif base_style.get("font_family"):
-            font.name = base_style.get("font_family")
 
 
 def apply_cell_border(cell, color: Optional[str], width_px: float) -> None:
@@ -2322,7 +2237,6 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
                 cell_style = cell_info.text_style or {}
                 style.update({k: v for k, v in cell_style.items() if v is not None})
             apply_paragraph_alignment(paragraph, style.get("align"))
-            apply_paragraph_line_height(paragraph, style.get("line_height"), style.get("font_size"))
             font = paragraph.font
             size = style.get("font_size", DEFAULT_FONT_SIZE)
             font.size = Pt(px_to_pt(size))
@@ -2334,11 +2248,6 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
             rgb = css_color_to_rgb_tuple(color)
             if rgb:
                 font.color.rgb = RGBColor(*rgb)
-            mapped_family = map_font_family(style.get("font_family"))
-            if mapped_family:
-                font.name = mapped_family
-            elif style.get("font_family"):
-                font.name = style.get("font_family")
             if cell_info:
                 bg = cell_info.background_color
                 if bg and not css_is_transparent(bg):
