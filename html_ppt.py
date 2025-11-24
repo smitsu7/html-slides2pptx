@@ -93,6 +93,14 @@ CSS_COLOR_KEYWORDS = {
     "olive": (128, 128, 0),
 }
 
+FONT_MAPPING = {
+    "yu gothic ui": "Yu Gothic UI",
+    "yu gothic": "Yu Gothic",
+    "meiryo": "Meiryo",
+    "aptos": "Calibri",
+    "inter": "Calibri",
+}
+
 BROWSER_COLLECT_JS = """
 ({ selector }) => {
   const TEXT_ACCEPT = new Set(["h1","h2","h3","h4","h5","h6","p","blockquote","div","section","article"]);
@@ -132,7 +140,11 @@ BROWSER_COLLECT_JS = """
         prev.fontSizePx === run.fontSizePx &&
         prev.fontWeight === run.fontWeight &&
         prev.fontStyle === run.fontStyle &&
-        prev.color === run.color
+        prev.color === run.color &&
+        prev.fontFamily === run.fontFamily &&
+        prev.lineHeight === run.lineHeight &&
+        prev.letterSpacing === run.letterSpacing &&
+        prev.textTransform === run.textTransform
       ) {
         prev.text += run.text;
       } else {
@@ -149,6 +161,10 @@ BROWSER_COLLECT_JS = """
       fontWeight: baseStyle.fontWeight,
       fontStyle: baseStyle.fontStyle,
       color: baseStyle.color,
+      fontFamily: baseStyle.fontFamily,
+      lineHeight: baseStyle.lineHeight,
+      letterSpacing: baseStyle.letterSpacing,
+      textTransform: baseStyle.textTransform,
     };
     const rawRuns = [];
     const traverse = (node, style) => {
@@ -161,6 +177,10 @@ BROWSER_COLLECT_JS = """
           fontWeight: style.fontWeight,
           fontStyle: style.fontStyle,
           color: style.color,
+          fontFamily: style.fontFamily,
+          lineHeight: style.lineHeight,
+          letterSpacing: style.letterSpacing,
+          textTransform: style.textTransform,
         });
         return;
       }
@@ -174,6 +194,10 @@ BROWSER_COLLECT_JS = """
           fontWeight: style.fontWeight,
           fontStyle: style.fontStyle,
           color: style.color,
+          fontFamily: style.fontFamily,
+          lineHeight: style.lineHeight,
+          letterSpacing: style.letterSpacing,
+          textTransform: style.textTransform,
         });
         return;
       }
@@ -183,6 +207,10 @@ BROWSER_COLLECT_JS = """
       if (cs.fontWeight) next.fontWeight = cs.fontWeight || next.fontWeight;
       if (cs.fontStyle) next.fontStyle = cs.fontStyle || next.fontStyle;
       if (cs.color) next.color = cs.color || next.color;
+      if (cs.fontFamily) next.fontFamily = cs.fontFamily || next.fontFamily;
+      if (cs.lineHeight) next.lineHeight = cs.lineHeight || next.lineHeight;
+      if (cs.letterSpacing) next.letterSpacing = cs.letterSpacing || next.letterSpacing;
+      if (cs.textTransform) next.textTransform = cs.textTransform || next.textTransform;
       if (tag === "strong" || tag === "b") next.fontWeight = "700";
       if (tag === "em" || tag === "i") next.fontStyle = "italic";
       for (const child of Array.from(node.childNodes || [])) {
@@ -233,10 +261,15 @@ BROWSER_COLLECT_JS = """
           fontWeight: cs.fontWeight,
           fontStyle: cs.fontStyle,
           color: cs.color,
-          textAlign: cs.textAlign
+          textAlign: cs.textAlign,
+          fontFamily: cs.fontFamily,
+          lineHeight: cs.lineHeight,
+          letterSpacing: cs.letterSpacing,
+          textTransform: cs.textTransform,
         },
         zIndex,
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       };
       blocks.push(block);
     }
@@ -265,10 +298,15 @@ BROWSER_COLLECT_JS = """
           fontSizePx: parseFloat(cs.fontSize) || undefined,
           fontWeight: cs.fontWeight,
           color: cs.color,
-          textAlign: cs.textAlign
+          textAlign: cs.textAlign,
+          fontFamily: cs.fontFamily,
+          lineHeight: cs.lineHeight,
+          letterSpacing: cs.letterSpacing,
+          textTransform: cs.textTransform,
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       });
     });
     return blocks;
@@ -322,10 +360,15 @@ BROWSER_COLLECT_JS = """
         styles: {
           fontSizePx: parseFloat(cs.fontSize) || undefined,
           color: cs.color,
-          textAlign: cs.textAlign
+          textAlign: cs.textAlign,
+          fontFamily: cs.fontFamily,
+          lineHeight: cs.lineHeight,
+          letterSpacing: cs.letterSpacing,
+          textTransform: cs.textTransform,
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       });
     });
     return blocks;
@@ -347,7 +390,8 @@ BROWSER_COLLECT_JS = """
         },
         src: img.currentSrc || img.src || "",
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       });
     });
     return blocks;
@@ -382,7 +426,8 @@ BROWSER_COLLECT_JS = """
           borderRadius: radius
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       });
     });
     return blocks;
@@ -511,7 +556,8 @@ BROWSER_COLLECT_JS = """
           segments
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++
+        order: counter.value++,
+        position: cs.position
       });
     });
     return blocks;
@@ -600,6 +646,7 @@ BROWSER_COLLECT_JS = """
             },
             zIndex: baseZ,
             order: counter.value++,
+            position: svgStyle.position
           });
         }
       });
@@ -631,6 +678,7 @@ BROWSER_COLLECT_JS = """
           },
           zIndex: baseZ,
           order: counter.value++,
+          position: svgStyle.position
         });
       });
 
@@ -663,6 +711,7 @@ BROWSER_COLLECT_JS = """
           },
           zIndex: baseZ,
           order: counter.value++,
+          position: svgStyle.position
         });
       });
     });
@@ -720,6 +769,7 @@ class TextRun:
     bold: Optional[bool] = None
     italic: Optional[bool] = None
     color: Optional[str] = None
+    font_family: Optional[str] = None
 
 
 @dataclass
@@ -747,6 +797,7 @@ class Block:
     text_style: Dict[str, Any] = field(default_factory=dict)
     vector_data: Dict[str, Any] = field(default_factory=dict)
     layout: LayoutBox = field(default_factory=LayoutBox)
+    position: Optional[str] = None  # static / relative / absolute / fixed
     z_index: int = 0
     order: int = 0
 
@@ -1081,6 +1132,31 @@ def parse_length(value: Optional[str], reference: Optional[float] = None) -> Opt
         return None
 
 
+def parse_line_height(value: Optional[str], font_size: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return None
+    s = value.strip().lower()
+    if not s or s == "normal":
+        return None
+    if s.endswith("px"):
+        try:
+            return float(s[:-2])
+        except ValueError:
+            return None
+    if s.endswith("%") and font_size:
+        try:
+            return float(s[:-1]) / 100.0 * font_size
+        except ValueError:
+            return None
+    try:
+        num = float(s)
+        if font_size:
+            return num * font_size if num <= 10 else num
+        return num if num > 0 else None
+    except ValueError:
+        return None
+
+
 def parse_font_size(value: Optional[str], tag: Optional[str] = None) -> float:
     size = parse_length(value)
     if size:
@@ -1088,6 +1164,13 @@ def parse_font_size(value: Optional[str], tag: Optional[str] = None) -> float:
     if tag and tag.lower() in TAG_FONT_SIZE:
         return TAG_FONT_SIZE[tag.lower()]
     return DEFAULT_FONT_SIZE
+
+
+def map_font_family(family: Optional[str]) -> Optional[str]:
+    if not family:
+        return None
+    base = family.split(",")[0].strip().strip("'\"").lower()
+    return FONT_MAPPING.get(base)
 
 
 def normalize_whitespace(text: str) -> str:
@@ -1188,6 +1271,7 @@ class StyleResolver:
 def build_text_style(tag: str, style: Dict[str, str]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     result["font_size"] = parse_font_size(style.get("font-size"), tag)
+    result["font_family"] = style.get("font-family")
     weight = style.get("font-weight", "").lower()
     if weight in {"bold", "bolder"}:
         result["bold"] = True
@@ -1202,6 +1286,13 @@ def build_text_style(tag: str, style: Dict[str, str]) -> Dict[str, Any]:
     align = style.get("text-align", "").lower()
     if align in {"left", "center", "right", "justify"}:
         result["align"] = align
+    line_height = parse_line_height(style.get("line-height"), result["font_size"])
+    if line_height:
+        result["line_height"] = line_height
+    if style.get("letter-spacing"):
+        result["letter_spacing"] = style.get("letter-spacing")
+    if style.get("text-transform"):
+        result["text_transform"] = style.get("text-transform")
     return result
 
 
@@ -1224,6 +1315,8 @@ def apply_text_style(base: Dict[str, Any], style: Dict[str, str], tag: Optional[
     size = parse_length(style.get("font-size"))
     if size:
         new_style["font_size"] = size
+    if style.get("font-family"):
+        new_style["font_family"] = style.get("font-family")
     weight = style.get("font-weight", "").lower()
     if weight in {"bold", "bolder"}:
         new_style["bold"] = True
@@ -1238,6 +1331,13 @@ def apply_text_style(base: Dict[str, Any], style: Dict[str, str], tag: Optional[
     align = style.get("text-align", "").lower()
     if align in {"left", "center", "right", "justify"}:
         new_style["align"] = align
+    line_height = parse_line_height(style.get("line-height"), new_style.get("font_size"))
+    if line_height:
+        new_style["line_height"] = line_height
+    if style.get("letter-spacing"):
+        new_style["letter_spacing"] = style.get("letter-spacing")
+    if style.get("text-transform"):
+        new_style["text_transform"] = style.get("text-transform")
     if tag in {"strong", "b"}:
         new_style["bold"] = True
     if tag in {"em", "i"}:
@@ -1274,6 +1374,7 @@ def merge_runs(runs: List[TextRun]) -> List[TextRun]:
                 and prev.bold == run.bold
                 and prev.italic == run.italic
                 and prev.color == run.color
+                and prev.font_family == run.font_family
             ):
                 prev.text += run.text
                 continue
@@ -1296,6 +1397,7 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                         bold=current_style.get("bold"),
                         italic=current_style.get("italic"),
                         color=current_style.get("color"),
+                        font_family=current_style.get("font_family"),
                     )
                 )
             return
@@ -1309,6 +1411,7 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                     bold=current_style.get("bold"),
                     italic=current_style.get("italic"),
                     color=current_style.get("color"),
+                    font_family=current_style.get("font_family"),
                 )
             )
             return
@@ -1329,6 +1432,7 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
                     bold=base_style.get("bold"),
                     italic=base_style.get("italic"),
                     color=base_style.get("color"),
+                    font_family=base_style.get("font_family"),
                 )
             )
     return merge_runs(runs)
@@ -1490,6 +1594,7 @@ def extract_blocks(
             )
 
         if block:
+            block.position = style.get("position")
             block.z_index = parse_z_index(style)
             block.order = order_counter
             order_counter += 1
@@ -1524,15 +1629,21 @@ def assign_fallback_layouts(slides: List[SlideModel]) -> None:
         slide_width = slide.canvas_width or SLIDE_REF_WIDTH
         flow_y = DEFAULT_PADDING_Y
         for block in slide.blocks:
+            position = (block.position or "").lower() if block.position else ""
+            is_absolute = position in {"absolute", "fixed"}
             if block.layout.left is None:
                 block.layout.left = DEFAULT_PADDING_X
             if block.layout.width is None:
                 block.layout.width = max(slide_width - 2 * DEFAULT_PADDING_X, 200.0)
             block_height = block.layout.height or estimate_block_height(block)
-            if block.layout.top is None:
-                block.layout.top = flow_y
             block.layout.height = block_height
-            flow_y = max(flow_y, block.layout.top + block.layout.height + FLOW_GAP)
+            if not is_absolute:
+                if block.layout.top is None:
+                    block.layout.top = flow_y
+                flow_y = max(flow_y, block.layout.top + block.layout.height + FLOW_GAP)
+            else:
+                if block.layout.top is None:
+                    block.layout.top = DEFAULT_PADDING_Y
 
 
 def apply_layout_constraints(slides: List[SlideModel]) -> None:
@@ -1742,6 +1853,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
     block = Block(kind=kind or "text", layout=layout)
     block.z_index = int(block_info.get("zIndex", 0) or 0)
     block.order = int(block_info.get("order", 0) or 0)
+    block.position = block_info.get("position")
     styles = block_info.get("styles") or {}
     align = (styles.get("textAlign") or "").lower() if styles.get("textAlign") else None
     if kind == "text":
@@ -1752,6 +1864,10 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         base_bold = css_weight_is_bold(styles.get("fontWeight"))
         base_italic = (styles.get("fontStyle") or "").lower() == "italic"
         base_color = styles.get("color")
+        base_font_family = styles.get("fontFamily")
+        base_line_height = parse_line_height(styles.get("lineHeight"), base_font_size)
+        base_letter_spacing = styles.get("letterSpacing")
+        base_text_transform = styles.get("textTransform")
         block.text = text
         block.text_style = {
             "font_size": base_font_size,
@@ -1759,7 +1875,13 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             "italic": base_italic,
             "color": base_color,
             "align": align,
+            "font_family": base_font_family,
+            "line_height": base_line_height,
         }
+        if base_letter_spacing:
+            block.text_style["letter_spacing"] = base_letter_spacing
+        if base_text_transform:
+            block.text_style["text_transform"] = base_text_transform
         run_entries = block_info.get("runs") or []
         runs: List[TextRun] = []
         for entry in run_entries:
@@ -1772,6 +1894,7 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                 (entry.get("fontStyle") or "").lower() == "italic" if entry.get("fontStyle") else base_italic
             )
             run_color = entry.get("color") or base_color
+            run_font_family = entry.get("fontFamily") or base_font_family
             runs.append(
                 TextRun(
                     text=segment,
@@ -1779,13 +1902,21 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                     bold=run_bold,
                     italic=run_italic,
                     color=run_color,
+                    font_family=run_font_family,
                 )
             )
         if runs:
             block.runs = runs
         else:
             block.runs = [
-                TextRun(text=text, font_size=base_font_size, bold=base_bold, italic=base_italic, color=base_color)
+                TextRun(
+                    text=text,
+                    font_size=base_font_size,
+                    bold=base_bold,
+                    italic=base_italic,
+                    color=base_color,
+                    font_family=base_font_family,
+                )
             ]
     elif kind == "list":
         items = block_info.get("items") or []
@@ -1801,6 +1932,10 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             elif fw_str in {"bold", "bolder"}:
                 bold = True
         color = styles.get("color")
+        font_family = styles.get("fontFamily")
+        line_height = parse_line_height(styles.get("lineHeight"), font_size)
+        letter_spacing = styles.get("letterSpacing")
+        text_transform = styles.get("textTransform")
         block.items = items
         block.numbered = bool(block_info.get("ordered"))
         block.text_style = {
@@ -1808,7 +1943,13 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             "bold": bold,
             "color": color,
             "align": align,
+            "font_family": font_family,
+            "line_height": line_height,
         }
+        if letter_spacing:
+            block.text_style["letter_spacing"] = letter_spacing
+        if text_transform:
+            block.text_style["text_transform"] = text_transform
     elif kind == "table":
         rows = block_info.get("rows") or []
         if not rows:
@@ -1817,7 +1958,13 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         block.text_style = {
             "font_size": float(styles.get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7),
             "color": styles.get("color"),
+            "font_family": styles.get("fontFamily"),
+            "line_height": parse_line_height(styles.get("lineHeight"), float(styles.get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7)),
         }
+        if styles.get("letterSpacing"):
+            block.text_style["letter_spacing"] = styles.get("letterSpacing")
+        if styles.get("textTransform"):
+            block.text_style["text_transform"] = styles.get("textTransform")
         row_cells_info = block_info.get("rowCells") or []
         table_cells: List[List[TableCell]] = []
         for row in row_cells_info:
@@ -1829,7 +1976,16 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                     "bold": css_weight_is_bold(cell_styles.get("fontWeight")),
                     "color": cell_styles.get("color"),
                     "align": (cell_styles.get("textAlign") or "").lower() or None,
+                    "font_family": cell_styles.get("fontFamily"),
+                    "line_height": parse_line_height(
+                        cell_styles.get("lineHeight"),
+                        float(cell_styles.get("fontSizePx") or block.text_style["font_size"]),
+                    ),
                 }
+                if cell_styles.get("letterSpacing"):
+                    text_style["letter_spacing"] = cell_styles.get("letterSpacing")
+                if cell_styles.get("textTransform"):
+                    text_style["text_transform"] = cell_styles.get("textTransform")
                 cell_objs.append(
                     TableCell(
                         text=cell_info.get("text", ""),
@@ -1983,6 +2139,15 @@ def apply_paragraph_alignment(paragraph, align: Optional[str]) -> None:
     paragraph.alignment = align_map.get(align, PP_ALIGN.LEFT)
 
 
+def apply_paragraph_line_height(paragraph, line_height: Optional[float], font_size: Optional[float]) -> None:
+    if not line_height or not font_size or font_size <= 0:
+        return
+    try:
+        paragraph.line_spacing = float(line_height) / float(font_size)
+    except Exception:
+        return
+
+
 def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
     left = position_to_emu(block.layout.left or DEFAULT_PADDING_X, "x", prs, slide_model)
     top = position_to_emu(block.layout.top or DEFAULT_PADDING_Y, "y", prs, slide_model)
@@ -1994,6 +2159,7 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
     tf.word_wrap = True
     tf.clear()
     base_style = block.text_style or {}
+    line_height_px = base_style.get("line_height")
     runs = block.runs or [
         TextRun(
             text=block.text,
@@ -2001,16 +2167,19 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             bold=base_style.get("bold"),
             italic=base_style.get("italic"),
             color=base_style.get("color"),
+            font_family=base_style.get("font_family"),
         )
     ]
     paragraph = tf.paragraphs[0]
     apply_paragraph_alignment(paragraph, base_style.get("align"))
+    apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
     for run in runs:
         pieces = run.text.split("\n")
         for idx, piece in enumerate(pieces):
             if idx > 0:
                 paragraph = tf.add_paragraph()
                 apply_paragraph_alignment(paragraph, base_style.get("align"))
+                apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
             ppt_run = paragraph.add_run()
             ppt_run.text = piece
             font = ppt_run.font
@@ -2022,6 +2191,12 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             rgb = css_color_to_rgb_tuple(color)
             if rgb:
                 font.color.rgb = RGBColor(*rgb)
+            mapped_family = map_font_family(run.font_family or base_style.get("font_family"))
+            if mapped_family:
+                font.name = mapped_family
+            elif run.font_family or base_style.get("font_family"):
+                font.name = (run.font_family or base_style.get("font_family"))
+            apply_paragraph_line_height(paragraph, line_height_px, size)
     if block.shape_style:
         shape_style = block.shape_style
         fill_color = css_color_to_rgb_tuple(shape_style.get("fill_color"))
@@ -2054,6 +2229,7 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
     tf.word_wrap = True
     tf.clear()
     base_style = block.text_style or {}
+    line_height_px = base_style.get("line_height")
     for idx, item in enumerate(block.items):
         paragraph = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         text = item.strip()
@@ -2061,6 +2237,7 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
             text = f"{idx + 1}. {text}"
         paragraph.text = text
         apply_paragraph_alignment(paragraph, base_style.get("align"))
+        apply_paragraph_line_height(paragraph, line_height_px, base_style.get("font_size"))
         font = paragraph.font
         size = base_style.get("font_size", DEFAULT_FONT_SIZE)
         font.size = Pt(px_to_pt(size))
@@ -2071,6 +2248,11 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
         rgb = css_color_to_rgb_tuple(base_style.get("color"))
         if rgb:
             font.color.rgb = RGBColor(*rgb)
+        mapped_family = map_font_family(base_style.get("font_family"))
+        if mapped_family:
+            font.name = mapped_family
+        elif base_style.get("font_family"):
+            font.name = base_style.get("font_family")
 
 
 def apply_cell_border(cell, color: Optional[str], width_px: float) -> None:
@@ -2140,6 +2322,7 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
                 cell_style = cell_info.text_style or {}
                 style.update({k: v for k, v in cell_style.items() if v is not None})
             apply_paragraph_alignment(paragraph, style.get("align"))
+            apply_paragraph_line_height(paragraph, style.get("line_height"), style.get("font_size"))
             font = paragraph.font
             size = style.get("font_size", DEFAULT_FONT_SIZE)
             font.size = Pt(px_to_pt(size))
@@ -2151,6 +2334,11 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
             rgb = css_color_to_rgb_tuple(color)
             if rgb:
                 font.color.rgb = RGBColor(*rgb)
+            mapped_family = map_font_family(style.get("font_family"))
+            if mapped_family:
+                font.name = mapped_family
+            elif style.get("font_family"):
+                font.name = style.get("font_family")
             if cell_info:
                 bg = cell_info.background_color
                 if bg and not css_is_transparent(bg):
