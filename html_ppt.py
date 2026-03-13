@@ -19,32 +19,32 @@ The focus is on editable output rather than pixel-perfect fidelity.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import math
 import re
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.xmlchemy import OxmlElement
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    sync_playwright = None
-
-try:
-    from PIL import Image, ImageColor
-except ImportError:
-    Image = None
-    ImageColor = None
+sync_playwright = None
+_PLAYWRIGHT_IMPORT_ATTEMPTED = False
+Image = None
+ImageColor = None
+_PIL_IMPORT_ATTEMPTED = False
 
 # Slide canvas size used internally (px). Actual PPTX is scaled proportionally.
 SLIDE_REF_WIDTH = 1920
@@ -93,13 +93,153 @@ CSS_COLOR_KEYWORDS = {
     "olive": (128, 128, 0),
 }
 
-FONT_MAPPING = {
-    "yu gothic ui": "Yu Gothic UI",
-    "yu gothic": "Yu Gothic",
-    "meiryo": "Meiryo",
-    "aptos": "Aptos",
-    "inter": "Calibri",
+GENERIC_FONT_MAPPING = {
+    "sans-serif": "Aptos",
+    "serif": "Times New Roman",
+    "monospace": "Consolas",
+    "system-ui": "Aptos",
+    "ui-sans-serif": "Aptos",
+    "ui-serif": "Times New Roman",
+    "ui-monospace": "Consolas",
 }
+
+PPT_PAGE_SIZES_INCHES = {
+    "16:9": (13.333, 7.5),
+    "a4": (11.693, 8.268),  # A4 landscape
+}
+
+ImageMap = Dict[str, str]
+
+
+def ensure_playwright():
+    global sync_playwright, _PLAYWRIGHT_IMPORT_ATTEMPTED
+    if sync_playwright is None and not _PLAYWRIGHT_IMPORT_ATTEMPTED:
+        _PLAYWRIGHT_IMPORT_ATTEMPTED = True
+        try:
+            from playwright.sync_api import sync_playwright as imported_sync_playwright
+        except ImportError:
+            return None
+        sync_playwright = imported_sync_playwright
+    return sync_playwright
+
+
+def ensure_pillow():
+    global Image, ImageColor, _PIL_IMPORT_ATTEMPTED
+    if Image is None and ImageColor is None and not _PIL_IMPORT_ATTEMPTED:
+        _PIL_IMPORT_ATTEMPTED = True
+        try:
+            from PIL import Image as imported_image, ImageColor as imported_image_color
+        except ImportError:
+            return None, None
+        Image = imported_image
+        ImageColor = imported_image_color
+    return Image, ImageColor
+
+
+def normalize_page_size(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"16:9", "16x9", "widescreen"}:
+        return "16:9"
+    if normalized in {"a4", "a4-landscape", "a4_l"}:
+        return "a4"
+    raise argparse.ArgumentTypeError("ページサイズは '16:9' または 'A4' を指定してください。")
+
+
+def parse_image_map_entry(value: str) -> Tuple[str, str]:
+    key, sep, mapped_path = value.partition("=")
+    if not sep or not key.strip() or not mapped_path.strip():
+        raise argparse.ArgumentTypeError("画像マッピングは 'IMAGE_URL_1=/path/to/file.png' 形式で指定してください。")
+    return key.strip(), mapped_path.strip()
+
+
+def encode_png_data_url(image_bytes: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+
+
+def has_large_column_panels(slide_model: "SlideModel") -> bool:
+    canvas_width = slide_model.canvas_width or SLIDE_REF_WIDTH
+    canvas_height = slide_model.canvas_height or SLIDE_REF_HEIGHT
+    panels = [
+        block
+        for block in slide_model.blocks
+        if block.kind == "shape"
+        and (block.layout.width or 0) >= canvas_width * 0.28
+        and (block.layout.height or 0) >= canvas_height * 0.6
+        and (block.layout.top or 0) <= canvas_height * 0.25
+    ]
+    return len(panels) >= 2
+
+
+def has_wide_bottom_callout(slide_model: "SlideModel") -> bool:
+    canvas_width = slide_model.canvas_width or SLIDE_REF_WIDTH
+    canvas_height = slide_model.canvas_height or SLIDE_REF_HEIGHT
+    for block in slide_model.blocks:
+        if block.kind != "shape":
+            continue
+        width = block.layout.width or 0
+        height = block.layout.height or 0
+        top = block.layout.top or 0
+        if width >= canvas_width * 0.85 and canvas_height * 0.45 <= top <= canvas_height * 0.75 and 36 <= height <= canvas_height * 0.2:
+            return True
+    return False
+
+
+def detect_auto_rasterize_slides(slides: List["SlideModel"]) -> Dict[int, str]:
+    targets: Dict[int, str] = {}
+    for index, slide_model in enumerate(slides):
+        block_kinds = [block.kind for block in slide_model.blocks]
+        table_count = block_kinds.count("table")
+        if not table_count:
+            continue
+        if "bar-chart" in block_kinds:
+            targets[index] = "table+chart"
+            continue
+        if has_large_column_panels(slide_model) and (block_kinds.count("shape") >= 4 or block_kinds.count("list") >= 1):
+            targets[index] = "dense-two-column"
+            continue
+        if has_wide_bottom_callout(slide_model):
+            targets[index] = "wide-callout"
+    return targets
+
+
+def resolve_rasterize_slide_targets(spec: str, slides: List["SlideModel"]) -> Dict[int, str]:
+    normalized = (spec or "").strip().lower()
+    if normalized in {"", "none", "off", "false"}:
+        return {}
+    targets: Dict[int, str] = {}
+    if normalized == "auto":
+        return detect_auto_rasterize_slides(slides)
+    auto_targets: Optional[Dict[int, str]] = None
+    for token in (part.strip() for part in normalized.split(",")):
+        if not token:
+            continue
+        if token == "auto":
+            if auto_targets is None:
+                auto_targets = detect_auto_rasterize_slides(slides)
+            targets.update(auto_targets)
+            continue
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            if not start_str.isdigit() or not end_str.isdigit():
+                raise ValueError(f"無効なスライド範囲です: {token}")
+            start = int(start_str)
+            end = int(end_str)
+            if start <= 0 or end <= 0:
+                raise ValueError(f"スライド番号は 1 以上で指定してください: {token}")
+            if end < start:
+                start, end = end, start
+            for slide_number in range(start, end + 1):
+                if slide_number <= len(slides):
+                    targets[slide_number - 1] = "manual"
+            continue
+        if not token.isdigit():
+            raise ValueError(f"無効なスライド指定です: {token}")
+        slide_number = int(token)
+        if slide_number <= 0:
+            raise ValueError(f"スライド番号は 1 以上で指定してください: {token}")
+        if slide_number <= len(slides):
+            targets[slide_number - 1] = "manual"
+    return targets
 
 BROWSER_COLLECT_JS = """
 ({ selector }) => {
@@ -130,6 +270,18 @@ BROWSER_COLLECT_JS = """
     return text.replace(/\\u00a0/g, " ").replace(/\\s+/g, " ");
   };
 
+  const applyTextTransform = (text, transform) => {
+    if (!text) return "";
+    const normalized = (transform || "").toLowerCase();
+    if (!normalized || normalized === "none") return text;
+    if (normalized === "uppercase") return text.toUpperCase();
+    if (normalized === "lowercase") return text.toLowerCase();
+    if (normalized === "capitalize") {
+      return text.replace(/(^|[\\s\\u3000])(\\S)/g, (match, prefix, char) => `${prefix}${char.toUpperCase()}`);
+    }
+    return text;
+  };
+
   const mergeRuns = (runs) => {
     const merged = [];
     for (const run of runs) {
@@ -140,7 +292,8 @@ BROWSER_COLLECT_JS = """
         prev.fontSizePx === run.fontSizePx &&
         prev.fontWeight === run.fontWeight &&
         prev.fontStyle === run.fontStyle &&
-        prev.color === run.color
+        prev.color === run.color &&
+        prev.fontFamily === run.fontFamily
       ) {
         prev.text += run.text;
       } else {
@@ -150,7 +303,7 @@ BROWSER_COLLECT_JS = """
     return merged;
   };
 
-  const collectInlineRuns = (root) => {
+  const collectInlineRuns = (root, skipNestedBlockNodes = false) => {
     const baseStyle = getComputedStyle(root);
     const base = {
       fontSizePx: parseFloat(baseStyle.fontSize) || undefined,
@@ -158,14 +311,12 @@ BROWSER_COLLECT_JS = """
       fontStyle: baseStyle.fontStyle,
       color: baseStyle.color,
       fontFamily: baseStyle.fontFamily,
-      lineHeight: baseStyle.lineHeight,
-      letterSpacing: baseStyle.letterSpacing,
       textTransform: baseStyle.textTransform,
     };
     const rawRuns = [];
     const traverse = (node, style) => {
       if (node.nodeType === Node.TEXT_NODE) {
-        const normalized = normalizeSpaces(node.nodeValue || "");
+        const normalized = applyTextTransform(normalizeSpaces(node.nodeValue || ""), style.textTransform);
         if (!normalized) return;
         rawRuns.push({
           text: normalized,
@@ -174,8 +325,6 @@ BROWSER_COLLECT_JS = """
           fontStyle: style.fontStyle,
           color: style.color,
           fontFamily: style.fontFamily,
-          lineHeight: style.lineHeight,
-          letterSpacing: style.letterSpacing,
           textTransform: style.textTransform,
         });
         return;
@@ -191,10 +340,11 @@ BROWSER_COLLECT_JS = """
           fontStyle: style.fontStyle,
           color: style.color,
           fontFamily: style.fontFamily,
-          lineHeight: style.lineHeight,
-          letterSpacing: style.letterSpacing,
           textTransform: style.textTransform,
         });
+        return;
+      }
+      if (skipNestedBlockNodes && BLOCK_TAGS.has(tag) && tag !== "span") {
         return;
       }
       const cs = getComputedStyle(node);
@@ -204,8 +354,6 @@ BROWSER_COLLECT_JS = """
       if (cs.fontStyle) next.fontStyle = cs.fontStyle || next.fontStyle;
       if (cs.color) next.color = cs.color || next.color;
       if (cs.fontFamily) next.fontFamily = cs.fontFamily || next.fontFamily;
-      if (cs.lineHeight) next.lineHeight = cs.lineHeight || next.lineHeight;
-      if (cs.letterSpacing) next.letterSpacing = cs.letterSpacing || next.letterSpacing;
       if (cs.textTransform) next.textTransform = cs.textTransform || next.textTransform;
       if (tag === "strong" || tag === "b") next.fontWeight = "700";
       if (tag === "em" || tag === "i") next.fontStyle = "italic";
@@ -219,10 +367,181 @@ BROWSER_COLLECT_JS = """
     return mergeRuns(rawRuns).filter(run => run.text && run.text.length);
   };
 
-  const collectTextBlocks = (slide, slideRect, counter) => {
+  const isExcluded = (node, excludedElements) => {
+    if (!excludedElements || !excludedElements.size || !node) return false;
+    let current = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {
+      if (excludedElements.has(current)) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+
+  const parseNumericText = (text) => {
+    if (!text) return null;
+    const match = text.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+    if (!match) return null;
+    const value = parseFloat(match[0]);
+    return Number.isFinite(value) ? value : null;
+  };
+
+  const parseCssColor = (value) => {
+    if (!value) return null;
+    const rgba = value.match(/rgba?\(([^)]+)\)/i);
+    if (rgba) {
+      const parts = rgba[1].split(",").map((part) => parseFloat(part.trim()));
+      if (parts.length >= 3) {
+        return [
+          Math.max(0, Math.min(255, Math.round(parts[0]))),
+          Math.max(0, Math.min(255, Math.round(parts[1]))),
+          Math.max(0, Math.min(255, Math.round(parts[2]))),
+          parts.length >= 4 && Number.isFinite(parts[3]) ? Math.max(0, Math.min(1, parts[3])) : 1,
+        ];
+      }
+    }
+    const hex = value.match(/#([0-9a-f]{3,8})/i);
+    if (!hex) return null;
+    const raw = hex[1];
+    if (raw.length === 3) {
+      return [
+        parseInt(raw[0] + raw[0], 16),
+        parseInt(raw[1] + raw[1], 16),
+        parseInt(raw[2] + raw[2], 16),
+        1,
+      ];
+    }
+    if (raw.length >= 6) {
+      return [
+        parseInt(raw.slice(0, 2), 16),
+        parseInt(raw.slice(2, 4), 16),
+        parseInt(raw.slice(4, 6), 16),
+        raw.length >= 8 ? parseInt(raw.slice(6, 8), 16) / 255 : 1,
+      ];
+    }
+    return null;
+  };
+
+  const approximateLinearGradientColor = (bgImage) => {
+    if (!bgImage || !bgImage.includes("linear-gradient")) return null;
+    const matches = bgImage.match(/rgba?\([^)]*\)|#[0-9a-fA-F]{3,8}/g);
+    if (!matches || !matches.length) return null;
+    const parsed = matches.map(parseCssColor).filter(Boolean);
+    if (!parsed.length) return null;
+    const first = parsed[0];
+    const last = parsed[parsed.length - 1];
+    const blend = [
+      Math.round((first[0] + last[0]) / 2),
+      Math.round((first[1] + last[1]) / 2),
+      Math.round((first[2] + last[2]) / 2),
+      (first[3] + last[3]) / 2,
+    ];
+    return `rgba(${blend[0]}, ${blend[1]}, ${blend[2]}, ${blend[3].toFixed(3)})`;
+  };
+
+  const collectRichTextRuns = (root) => {
+    const baseStyle = getComputedStyle(root);
+    const base = {
+      fontSizePx: parseFloat(baseStyle.fontSize) || undefined,
+      fontWeight: baseStyle.fontWeight,
+      fontStyle: baseStyle.fontStyle,
+      color: baseStyle.color,
+      fontFamily: baseStyle.fontFamily,
+      textTransform: baseStyle.textTransform,
+    };
+    const rawRuns = [];
+    const pushRun = (text, style) => {
+      if (!text) return;
+      rawRuns.push({
+        text,
+        fontSizePx: style.fontSizePx,
+        fontWeight: style.fontWeight,
+        fontStyle: style.fontStyle,
+        color: style.color,
+        fontFamily: style.fontFamily,
+        textTransform: style.textTransform,
+      });
+    };
+    const trimTrailingWhitespace = () => {
+      while (rawRuns.length) {
+        const last = rawRuns[rawRuns.length - 1];
+        if (!last) break;
+        if (last.text === "\\n") return;
+        const trimmed = last.text.replace(/[ \t]+$/g, "");
+        if (trimmed === "") {
+          rawRuns.pop();
+          continue;
+        }
+        last.text = trimmed;
+        return;
+      }
+    };
+    const ensureNewline = (style) => {
+      trimTrailingWhitespace();
+      const last = rawRuns[rawRuns.length - 1];
+      if (!last || last.text.endsWith("\\n")) return;
+      pushRun("\\n", style);
+    };
+    const traverse = (node, style) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const rawText = node.nodeValue || "";
+        if (!/\\S/.test(rawText)) return;
+        const normalized = applyTextTransform(normalizeSpaces(rawText), style.textTransform);
+        if (normalized) pushRun(normalized, style);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "script" || tag === "style" || tag === "noscript") return;
+      if (tag === "br") {
+        pushRun("\\n", style);
+        return;
+      }
+      const cs = getComputedStyle(node);
+      const next = { ...style };
+      if (cs.fontSize) next.fontSizePx = parseFloat(cs.fontSize) || next.fontSizePx;
+      if (cs.fontWeight) next.fontWeight = cs.fontWeight || next.fontWeight;
+      if (cs.fontStyle) next.fontStyle = cs.fontStyle || next.fontStyle;
+      if (cs.color) next.color = cs.color || next.color;
+      if (cs.fontFamily) next.fontFamily = cs.fontFamily || next.fontFamily;
+      if (cs.textTransform) next.textTransform = cs.textTransform || next.textTransform;
+      if (tag === "strong" || tag === "b") next.fontWeight = "700";
+      if (tag === "em" || tag === "i") next.fontStyle = "italic";
+      if (tag === "li") {
+        ensureNewline(next);
+        pushRun("• ", next);
+      } else if (["p", "div"].includes(tag) && rawRuns.length) {
+        ensureNewline(next);
+      }
+      for (const child of Array.from(node.childNodes || [])) {
+        traverse(child, next);
+      }
+      if (["li", "p", "div"].includes(tag)) {
+        ensureNewline(next);
+      }
+    };
+    for (const child of Array.from(root.childNodes || [])) {
+      traverse(child, base);
+    }
+    const merged = mergeRuns(rawRuns)
+      .map((run) => ({
+        ...run,
+        text: run.text
+          .replace(/[ \t]*\\n[ \t]*/g, "\\n")
+          .replace(/\\n{2,}/g, "\\n"),
+      }))
+      .filter((run) => run.text && run.text.replace(/\\n/g, "").trim().length);
+    if (merged.length) {
+      merged[0].text = merged[0].text.replace(/^\\n+/, "");
+      merged[merged.length - 1].text = merged[merged.length - 1].text.replace(/\\n+$/, "");
+    }
+    return merged.filter(run => run.text && run.text.length);
+  };
+
+  const collectTextBlocks = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     const walker = document.createTreeWalker(slide, NodeFilter.SHOW_ELEMENT, {
       acceptNode(node) {
+        if (isExcluded(node, excludedElements)) return NodeFilter.FILTER_REJECT;
         const tag = node.tagName ? node.tagName.toLowerCase() : "";
         if (!TEXT_ACCEPT.has(tag)) return NodeFilter.FILTER_SKIP;
         if (tag === "div" || tag === "section" || tag === "article" || tag === "span") {
@@ -254,31 +573,407 @@ BROWSER_COLLECT_JS = """
         runs,
         styles: {
           fontSizePx: parseFloat(cs.fontSize) || undefined,
+          lineHeightPx: parseFloat(cs.lineHeight) || undefined,
           fontWeight: cs.fontWeight,
           fontStyle: cs.fontStyle,
           color: cs.color,
-          textAlign: cs.textAlign,
           fontFamily: cs.fontFamily,
-          lineHeight: cs.lineHeight,
-          letterSpacing: cs.letterSpacing,
+          textAlign: cs.textAlign,
           textTransform: cs.textTransform,
+          whiteSpace: cs.whiteSpace,
+          paddingLeft: parseFloat(cs.paddingLeft) || 0,
+          paddingRight: parseFloat(cs.paddingRight) || 0,
+          paddingTop: parseFloat(cs.paddingTop) || 0,
+          paddingBottom: parseFloat(cs.paddingBottom) || 0,
         },
         zIndex,
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       };
       blocks.push(block);
     }
     return blocks;
   };
 
-  const collectLists = (slide, slideRect, counter) => {
+  const collectMixedTextBlocks = (slide, slideRect, counter, excludedElements = null) => {
+    const blocks = [];
+    slide.querySelectorAll("div,section,article").forEach((el) => {
+      if (isExcluded(el, excludedElements)) return;
+      if (!hasNestedBlocks(el)) return;
+      if (el.closest("ul,ol,table")) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 4 || rect.height < 12) return;
+      const runs = collectInlineRuns(el, true);
+      const combinedText = runs.map(run => run.text).join("");
+      if (!combinedText.trim()) return;
+      const directBlocks = Array.from(el.children || []).filter((child) => {
+        const tag = child.tagName ? child.tagName.toLowerCase() : "";
+        return BLOCK_TAGS.has(tag) && child.innerText && child.innerText.trim().length;
+      });
+      let y = rect.y - slideRect.y;
+      let h = rect.height;
+      if (directBlocks.length) {
+        const childRects = directBlocks.map((child) => child.getBoundingClientRect());
+        const firstTop = Math.min(...childRects.map((childRect) => childRect.top));
+        const lastBottom = Math.max(...childRects.map((childRect) => childRect.bottom));
+        const topGap = Math.max(0, firstTop - rect.top);
+        const bottomGap = Math.max(0, rect.bottom - lastBottom);
+        if (topGap >= 8 && topGap >= bottomGap) {
+          h = Math.max(0, topGap - 4);
+        } else if (bottomGap >= 8) {
+          y = Math.min(
+            Math.max(lastBottom - slideRect.y + 4, y),
+            rect.y - slideRect.y + rect.height - 8
+          );
+          h = rect.y - slideRect.y + rect.height - y;
+        }
+      }
+      if (h < 8) return;
+      const cs = getComputedStyle(el);
+      blocks.push({
+        kind: "text",
+        rect: {
+          x: rect.x - slideRect.x,
+          y,
+          w: rect.width,
+          h
+        },
+        text: combinedText,
+        runs,
+        styles: {
+          fontSizePx: parseFloat(cs.fontSize) || undefined,
+          lineHeightPx: parseFloat(cs.lineHeight) || undefined,
+          fontWeight: cs.fontWeight,
+          fontStyle: cs.fontStyle,
+          color: cs.color,
+          fontFamily: cs.fontFamily,
+          textAlign: cs.textAlign,
+          textTransform: cs.textTransform,
+          whiteSpace: cs.whiteSpace,
+          paddingLeft: parseFloat(cs.paddingLeft) || 0,
+          paddingRight: parseFloat(cs.paddingRight) || 0,
+          paddingTop: parseFloat(cs.paddingTop) || 0,
+          paddingBottom: parseFloat(cs.paddingBottom) || 0,
+        },
+        zIndex: parseZ(cs.zIndex),
+        order: counter.value++
+      });
+    });
+    return blocks;
+  };
+
+  const collectBarCharts = (slide, slideRect, counter) => {
+    const blocks = [];
+    const excludedElements = new Set();
+    slide.querySelectorAll("div").forEach((container) => {
+      if (container === slide || container.closest("table,svg")) return;
+      const containerRect = container.getBoundingClientRect();
+      const pushChart = (rowData, labelStyles, labelColumnWidth, extraExcluded) => {
+        if (!rowData.length) return;
+        const titleEl = Array.from(container.children || []).find((child) => {
+          if (!child || !child.tagName) return false;
+          return child.classList && child.classList.contains("annotation");
+        });
+        let title = null;
+        if (titleEl) {
+          const titleRect = titleEl.getBoundingClientRect();
+          const titleStyle = getComputedStyle(titleEl);
+          title = {
+            text: (titleEl.innerText || "").trim(),
+            rect: {
+              x: titleRect.x - containerRect.x,
+              y: titleRect.y - containerRect.y,
+              w: titleRect.width,
+              h: titleRect.height,
+            },
+            styles: {
+              fontSizePx: parseFloat(titleStyle.fontSize) || undefined,
+              fontWeight: titleStyle.fontWeight,
+              fontStyle: titleStyle.fontStyle,
+              color: titleStyle.color,
+              fontFamily: titleStyle.fontFamily,
+              textAlign: titleStyle.textAlign,
+            }
+          };
+        }
+        const resolvedMax = Math.max(
+          ...rowData.map((row) => row.numericValue || row.ratio * 100 || 0),
+          100
+        );
+        rowData.forEach((row) => {
+          if (row.ratio <= 0 && row.numericValue !== null && resolvedMax > 0) {
+            row.ratio = Math.max(0, Math.min(1, row.numericValue / resolvedMax));
+          }
+        });
+        blocks.push({
+          kind: "bar-chart",
+          rect: {
+            x: containerRect.x - slideRect.x,
+            y: containerRect.y - slideRect.y,
+            w: containerRect.width,
+            h: containerRect.height
+          },
+          chart: {
+            labelColumnWidth,
+            valueColumnWidth: Math.max(...rowData.map((row) => (row.valueRect || {}).w || 0), 0),
+            maxValue: resolvedMax,
+            labelStyles,
+            title,
+            rows: rowData
+          },
+          zIndex: parseZ(getComputedStyle(container).zIndex),
+          order: counter.value++
+        });
+        excludedElements.add(container);
+        extraExcluded.forEach((el) => excludedElements.add(el));
+      };
+
+      const classBarRows = Array.from(container.querySelectorAll(":scope > .bar-row"));
+      if (container.classList.contains("bar-chart") && classBarRows.length >= 2) {
+        const labelStyle = getComputedStyle(classBarRows[0].querySelector(".bar-label") || container);
+        const rowData = [];
+        let labelColumnWidth = 0;
+        const elementsToExclude = [container, ...classBarRows];
+        classBarRows.forEach((row) => {
+          const labelEl = row.querySelector(":scope > .bar-label");
+          const trackEl = row.querySelector(":scope > .bar-container");
+          const fillEl = trackEl ? trackEl.querySelector(":scope > .bar-fill, :scope > div") : null;
+          if (!labelEl || !trackEl || !fillEl) return;
+          const rowRect = row.getBoundingClientRect();
+          const labelRect = labelEl.getBoundingClientRect();
+          const trackRect = trackEl.getBoundingClientRect();
+          const fillRect = fillEl.getBoundingClientRect();
+          if (trackRect.width < 30 || rowRect.height < 10) return;
+          labelColumnWidth = Math.max(labelColumnWidth, labelRect.width);
+          const valueText = (fillEl.innerText || "").trim();
+          const numericValue = parseNumericText(valueText);
+          const ratio = trackRect.width > 0 ? Math.max(0, Math.min(1, fillRect.width / trackRect.width)) : 0;
+          const trackStyle = getComputedStyle(trackEl);
+          const fillStyle = getComputedStyle(fillEl);
+          rowData.push({
+            label: (labelEl.innerText || "").trim(),
+            numericValue,
+            valueText,
+            ratio,
+            valueInsideFill: true,
+            rowRect: {
+              x: rowRect.x - containerRect.x,
+              y: rowRect.y - containerRect.y,
+              w: rowRect.width,
+              h: rowRect.height,
+            },
+            trackRect: {
+              x: trackRect.x - containerRect.x,
+              y: trackRect.y - containerRect.y,
+              w: trackRect.width,
+              h: trackRect.height,
+            },
+            valueRect: {
+              x: fillRect.x - containerRect.x,
+              y: fillRect.y - containerRect.y,
+              w: fillRect.width,
+              h: fillRect.height,
+            },
+            trackStyle: {
+              backgroundColor: trackStyle.backgroundColor,
+              borderRadius: parseFloat(trackStyle.borderRadius) || 0,
+            },
+            fillStyle: {
+              backgroundColor: fillStyle.backgroundColor,
+              borderRadius: parseFloat(fillStyle.borderRadius) || 0,
+            },
+            valueStyles: {
+              fontSizePx: parseFloat(fillStyle.fontSize) || undefined,
+              fontWeight: fillStyle.fontWeight,
+              fontStyle: fillStyle.fontStyle,
+              color: fillStyle.color,
+              fontFamily: fillStyle.fontFamily,
+              textAlign: "right",
+            },
+          });
+          elementsToExclude.push(labelEl, trackEl, fillEl);
+        });
+        if (rowData.length >= 2) {
+          pushChart(
+            rowData,
+            {
+              fontSizePx: parseFloat(labelStyle.fontSize) || undefined,
+              fontWeight: labelStyle.fontWeight,
+              fontStyle: labelStyle.fontStyle,
+              color: labelStyle.color,
+              fontFamily: labelStyle.fontFamily,
+              textAlign: labelStyle.textAlign,
+            },
+            labelColumnWidth,
+            elementsToExclude
+          );
+          return;
+        }
+      }
+
+      const children = Array.from(container.children || []).filter((child) => child.tagName);
+      if (children.length !== 2) return;
+      const [labelsEl, barsEl] = children;
+      const barRows = Array.from(barsEl.children || []).filter((child) => child.tagName);
+      if (barRows.length < 2) return;
+      const labels = (labelsEl.innerText || "").split(/\\n+/).map((line) => line.trim()).filter(Boolean);
+      if (labels.length !== barRows.length) return;
+      const rowData = [];
+      let valid = true;
+
+      barRows.forEach((row, index) => {
+        const rowChildren = Array.from(row.children || []).filter((child) => child.tagName);
+        if (rowChildren.length < 2) {
+          valid = false;
+          return;
+        }
+        const trackEl = rowChildren[0];
+        const valueEl = rowChildren[rowChildren.length - 1];
+        if ((trackEl.tagName || "").toLowerCase() !== "div") {
+          valid = false;
+          return;
+        }
+        const fillEl = Array.from(trackEl.children || []).find(
+          (child) => (child.tagName || "").toLowerCase() === "div"
+        );
+        if (!fillEl) {
+          valid = false;
+          return;
+        }
+
+        const rowRect = row.getBoundingClientRect();
+        const trackRect = trackEl.getBoundingClientRect();
+        const fillRect = fillEl.getBoundingClientRect();
+        const valueRect = valueEl.getBoundingClientRect();
+        if (rowRect.width < 80 || trackRect.width < 30 || rowRect.height < 10) {
+          valid = false;
+          return;
+        }
+
+        const valueText = (valueEl.innerText || "").trim();
+        const numericValue = parseNumericText(valueText);
+        let ratio = trackRect.width > 0 ? fillRect.width / trackRect.width : 0;
+        ratio = Math.max(0, Math.min(1, ratio));
+        if (numericValue === null && ratio <= 0) {
+          valid = false;
+          return;
+        }
+
+        const trackStyle = getComputedStyle(trackEl);
+        const fillStyle = getComputedStyle(fillEl);
+        const valueStyle = getComputedStyle(valueEl);
+        rowData.push({
+          label: labels[index],
+          numericValue,
+          valueText,
+          ratio,
+          rowRect: {
+            x: rowRect.x - container.getBoundingClientRect().x,
+            y: rowRect.y - container.getBoundingClientRect().y,
+            w: rowRect.width,
+            h: rowRect.height,
+          },
+          trackRect: {
+            x: trackRect.x - container.getBoundingClientRect().x,
+            y: trackRect.y - container.getBoundingClientRect().y,
+            w: trackRect.width,
+            h: trackRect.height,
+          },
+          valueRect: {
+            x: valueRect.x - container.getBoundingClientRect().x,
+            y: valueRect.y - container.getBoundingClientRect().y,
+            w: valueRect.width,
+            h: valueRect.height,
+          },
+          trackStyle: {
+            backgroundColor: trackStyle.backgroundColor,
+            borderRadius: parseFloat(trackStyle.borderRadius) || 0,
+          },
+          fillStyle: {
+            backgroundColor: fillStyle.backgroundColor,
+            borderRadius: parseFloat(fillStyle.borderRadius) || 0,
+          },
+          valueStyles: {
+            fontSizePx: parseFloat(valueStyle.fontSize) || undefined,
+            fontWeight: valueStyle.fontWeight,
+            fontStyle: valueStyle.fontStyle,
+            color: valueStyle.color,
+            fontFamily: valueStyle.fontFamily,
+            textAlign: valueStyle.textAlign,
+          },
+        });
+      });
+
+      if (!valid || rowData.length !== barRows.length) return;
+      const labelsRect = labelsEl.getBoundingClientRect();
+      const labelStyle = getComputedStyle(labelsEl);
+      const elementsToExclude = [container, labelsEl, barsEl, ...barRows];
+      barRows.forEach((row) => {
+        Array.from(row.children || []).forEach((child) => {
+          elementsToExclude.push(child);
+          Array.from(child.children || []).forEach((grandChild) => elementsToExclude.push(grandChild));
+        });
+      });
+      pushChart(
+        rowData,
+        {
+          fontSizePx: parseFloat(labelStyle.fontSize) || undefined,
+          fontWeight: labelStyle.fontWeight,
+          fontStyle: labelStyle.fontStyle,
+          color: labelStyle.color,
+          fontFamily: labelStyle.fontFamily,
+          textAlign: labelStyle.textAlign,
+        },
+        labelsRect.width,
+        elementsToExclude
+      );
+    });
+    return { blocks, excludedElements };
+  };
+
+  const collectLists = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     slide.querySelectorAll("ul,ol").forEach((list) => {
+      if (isExcluded(list, excludedElements)) return;
+      if (list.closest("table")) return;
       const rect = list.getBoundingClientRect();
       if (rect.width < 4 || rect.height < 4) return;
       const cs = getComputedStyle(list);
-      const items = Array.from(list.querySelectorAll(":scope > li")).map(li => (li.innerText || "").trim()).filter(Boolean);
+      const itemMeta = [];
+      const items = [];
+      Array.from(list.querySelectorAll(":scope > li")).forEach((li) => {
+        const text = (li.innerText || "").trim();
+        if (!text) return;
+        const liRect = li.getBoundingClientRect();
+        const liStyle = getComputedStyle(li);
+        itemMeta.push({
+          text,
+          rect: {
+            x: liRect.x - rect.x,
+            y: liRect.y - rect.y,
+            w: liRect.width,
+            h: liRect.height,
+          },
+          runs: collectRichTextRuns(li),
+          styles: {
+            fontSizePx: parseFloat(liStyle.fontSize) || undefined,
+            lineHeightPx: parseFloat(liStyle.lineHeight) || undefined,
+            fontWeight: liStyle.fontWeight,
+            fontStyle: liStyle.fontStyle,
+            color: liStyle.color,
+            fontFamily: liStyle.fontFamily,
+            textAlign: liStyle.textAlign,
+            textTransform: liStyle.textTransform,
+            whiteSpace: liStyle.whiteSpace,
+            paddingLeft: parseFloat(liStyle.paddingLeft) || 0,
+            paddingRight: parseFloat(liStyle.paddingRight) || 0,
+            paddingTop: parseFloat(liStyle.paddingTop) || 0,
+            paddingBottom: parseFloat(liStyle.paddingBottom) || 0,
+            marginTop: parseFloat(liStyle.marginTop) || 0,
+            marginBottom: parseFloat(liStyle.marginBottom) || 0,
+          },
+        });
+        items.push(text);
+      });
       if (!items.length) return;
       blocks.push({
         kind: "list",
@@ -292,47 +987,83 @@ BROWSER_COLLECT_JS = """
         ordered: list.tagName.toLowerCase() === "ol",
         styles: {
           fontSizePx: parseFloat(cs.fontSize) || undefined,
+          lineHeightPx: parseFloat(cs.lineHeight) || undefined,
           fontWeight: cs.fontWeight,
+          fontStyle: cs.fontStyle,
           color: cs.color,
-          textAlign: cs.textAlign,
           fontFamily: cs.fontFamily,
-          lineHeight: cs.lineHeight,
-          letterSpacing: cs.letterSpacing,
+          textAlign: cs.textAlign,
           textTransform: cs.textTransform,
+          whiteSpace: cs.whiteSpace,
+          paddingLeft: parseFloat(cs.paddingLeft) || 0,
+          paddingRight: parseFloat(cs.paddingRight) || 0,
+          paddingTop: parseFloat(cs.paddingTop) || 0,
+          paddingBottom: parseFloat(cs.paddingBottom) || 0,
+          listStyleType: cs.listStyleType,
+          listStylePosition: cs.listStylePosition,
         },
+        itemMeta,
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       });
     });
     return blocks;
   };
 
-  const collectTables = (slide, slideRect, counter) => {
+  const collectTables = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     slide.querySelectorAll("table").forEach((tbl) => {
+      if (isExcluded(tbl, excludedElements)) return;
       const rect = tbl.getBoundingClientRect();
       if (rect.width < 4 || rect.height < 4) return;
       const rows = [];
       const rowCells = [];
+      const columnWidths = [];
+      const rowHeights = [];
       tbl.querySelectorAll("tr").forEach((tr) => {
         const row = [];
         const cells = [];
+        const trRect = tr.getBoundingClientRect();
+        rowHeights.push(trRect.height);
+        let colIndex = 0;
         tr.querySelectorAll("th,td").forEach((cell) => {
           const text = (cell.innerText || "").trim();
           const csCell = getComputedStyle(cell);
+          const cellRect = cell.getBoundingClientRect();
+          const colSpan = parseInt(cell.getAttribute("colspan") || "1", 10) || 1;
+          const avgWidth = colSpan > 0 ? cellRect.width / colSpan : cellRect.width;
+          for (let offset = 0; offset < colSpan; offset++) {
+            const targetIndex = colIndex + offset;
+            columnWidths[targetIndex] = Math.max(columnWidths[targetIndex] || 0, avgWidth);
+          }
+          colIndex += colSpan;
           row.push(text);
           cells.push({
             text,
+            runs: collectRichTextRuns(cell),
+            isHeader: (cell.tagName || "").toLowerCase() === "th",
+            colSpan,
+            rowSpan: parseInt(cell.getAttribute("rowspan") || "1", 10) || 1,
+            rect: {
+              w: cellRect.width,
+              h: cellRect.height
+            },
             styles: {
               backgroundColor: csCell.backgroundColor,
               borderColor: csCell.borderColor,
               borderWidth: parseFloat(csCell.borderWidth) || 0,
               color: csCell.color,
               fontSizePx: parseFloat(csCell.fontSize) || undefined,
+              lineHeightPx: parseFloat(csCell.lineHeight) || undefined,
               fontWeight: csCell.fontWeight,
+              fontStyle: csCell.fontStyle,
+              fontFamily: csCell.fontFamily,
               textAlign: csCell.textAlign,
-              verticalAlign: csCell.verticalAlign
+              verticalAlign: csCell.verticalAlign,
+              paddingLeft: parseFloat(csCell.paddingLeft) || 0,
+              paddingRight: parseFloat(csCell.paddingRight) || 0,
+              paddingTop: parseFloat(csCell.paddingTop) || 0,
+              paddingBottom: parseFloat(csCell.paddingBottom) || 0
             }
           });
         });
@@ -353,29 +1084,45 @@ BROWSER_COLLECT_JS = """
         },
         rows,
         rowCells,
+        columnWidths,
+        rowHeights,
         styles: {
           fontSizePx: parseFloat(cs.fontSize) || undefined,
           color: cs.color,
-          textAlign: cs.textAlign,
           fontFamily: cs.fontFamily,
-          lineHeight: cs.lineHeight,
-          letterSpacing: cs.letterSpacing,
-          textTransform: cs.textTransform,
+          textAlign: cs.textAlign,
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       });
     });
     return blocks;
   };
 
-  const collectImages = (slide, slideRect, counter) => {
+  const collectImages = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     slide.querySelectorAll("img").forEach((img) => {
+      if (isExcluded(img, excludedElements)) return;
       const rect = img.getBoundingClientRect();
       if (rect.width < 4 || rect.height < 4) return;
       const cs = getComputedStyle(img);
+      let dataUrl = null;
+      try {
+        if (img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
+          const maxDim = 2048;
+          const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            dataUrl = canvas.toDataURL("image/png");
+          }
+        }
+      } catch (err) {
+        dataUrl = null;
+      }
       blocks.push({
         kind: "image",
         rect: {
@@ -385,27 +1132,49 @@ BROWSER_COLLECT_JS = """
           h: rect.height
         },
         src: img.currentSrc || img.src || "",
+        alt: img.alt || "",
+        dataUrl,
+        naturalWidth: img.naturalWidth || undefined,
+        naturalHeight: img.naturalHeight || undefined,
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       });
     });
     return blocks;
   };
 
-  const collectShapes = (slide, slideRect, counter) => {
+  const collectShapes = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     slide.querySelectorAll("*").forEach((el) => {
       if (el === slide) return;
+      if (isExcluded(el, excludedElements)) return;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (["table", "thead", "tbody", "tfoot", "tr", "td", "th", "svg"].includes(tag)) {
+        return;
+      }
+      if (el.closest("table, svg")) return;
       const rect = el.getBoundingClientRect();
       if (rect.width < 6 || rect.height < 6) return;
       const cs = getComputedStyle(el);
-      const bg = cs.backgroundColor;
+      const bgImage = cs.backgroundImage || "";
+      const approxGradientFill = approximateLinearGradientColor(bgImage);
+      const bg = cs.backgroundColor && !/^rgba?\(0,\s*0,\s*0,\s*0\)/i.test(cs.backgroundColor)
+        ? cs.backgroundColor
+        : approxGradientFill;
       const borderWidth = parseFloat(cs.borderWidth) || 0;
       const borderColor = cs.borderColor;
+      const borderTopWidth = parseFloat(cs.borderTopWidth) || 0;
+      const borderRightWidth = parseFloat(cs.borderRightWidth) || 0;
+      const borderBottomWidth = parseFloat(cs.borderBottomWidth) || 0;
+      const borderLeftWidth = parseFloat(cs.borderLeftWidth) || 0;
       const radius = parseFloat(cs.borderRadius) || 0;
-      const hasFill = bg && !/^rgba?\(0,\s*0,\s*0,\s*0\)/i.test(bg);
-      const hasBorder = borderWidth > 0 && borderColor && borderColor !== "rgba(0, 0, 0, 0)";
+      const hasFill = Boolean(bg && !/^rgba?\(0,\s*0,\s*0,\s*0\)/i.test(bg));
+      const hasBorder =
+        (borderWidth > 0 && borderColor && borderColor !== "rgba(0, 0, 0, 0)") ||
+        borderTopWidth > 0 ||
+        borderRightWidth > 0 ||
+        borderBottomWidth > 0 ||
+        borderLeftWidth > 0;
       if (!hasFill && !hasBorder) return;
       blocks.push({
         kind: "shape",
@@ -419,11 +1188,23 @@ BROWSER_COLLECT_JS = """
           fill: bg,
           borderColor: borderColor,
           borderWidth,
-          borderRadius: radius
+          borderTopWidth,
+          borderRightWidth,
+          borderBottomWidth,
+          borderLeftWidth,
+          borderTopColor: cs.borderTopColor,
+          borderRightColor: cs.borderRightColor,
+          borderBottomColor: cs.borderBottomColor,
+          borderLeftColor: cs.borderLeftColor,
+          borderRadius: radius,
+          isEllipse:
+            rect.width > 20 &&
+            rect.height > 20 &&
+            Math.abs(rect.width - rect.height) <= Math.max(rect.width, rect.height) * 0.15 &&
+            ((cs.borderRadius || "").includes("%") || radius >= Math.min(rect.width, rect.height) / 2 - 2)
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       });
     });
     return blocks;
@@ -527,9 +1308,10 @@ BROWSER_COLLECT_JS = """
     return segments.length ? segments : null;
   };
 
-  const collectConicGradients = (slide, slideRect, counter) => {
+  const collectConicGradients = (slide, slideRect, counter, excludedElements = null) => {
     const blocks = [];
     slide.querySelectorAll("*").forEach((el) => {
+      if (isExcluded(el, excludedElements)) return;
       const rect = el.getBoundingClientRect();
       if (rect.width < 20 || rect.height < 20) return;
       const cs = getComputedStyle(el);
@@ -552,14 +1334,13 @@ BROWSER_COLLECT_JS = """
           segments
         },
         zIndex: parseZ(cs.zIndex),
-        order: counter.value++,
-        position: cs.position
+        order: counter.value++
       });
     });
     return blocks;
   };
 
-  const collectSvgElements = (slide, slideRect, counter) => {
+  const collectSvgElements = (slide, slideRect, counter, excludedElements = null) => {
     const result = [];
     const parseLength = (value, fallback = 0) => {
       if (value === undefined || value === null) return fallback;
@@ -568,6 +1349,7 @@ BROWSER_COLLECT_JS = """
       return Number.isFinite(num) ? num : fallback;
     };
     slide.querySelectorAll("svg").forEach((svg) => {
+      if (isExcluded(svg, excludedElements)) return;
       const svgRect = svg.getBoundingClientRect();
       if (svgRect.width < 2 || svgRect.height < 2) return;
       const viewBox = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal : null;
@@ -641,8 +1423,7 @@ BROWSER_COLLECT_JS = """
               h: svgRect.height,
             },
             zIndex: baseZ,
-            order: counter.value++,
-            position: svgStyle.position
+            order: counter.value++
           });
         }
       });
@@ -673,8 +1454,7 @@ BROWSER_COLLECT_JS = """
             h: svgRect.height,
           },
           zIndex: baseZ,
-          order: counter.value++,
-          position: svgStyle.position
+          order: counter.value++
         });
       });
 
@@ -706,8 +1486,7 @@ BROWSER_COLLECT_JS = """
             h: svgRect.height,
           },
           zIndex: baseZ,
-          order: counter.value++,
-          position: svgStyle.position
+          order: counter.value++
         });
       });
     });
@@ -723,14 +1502,17 @@ BROWSER_COLLECT_JS = """
       background = bodyStyle.backgroundColor || background;
     }
     const counter = { value: 0 };
+    const barCharts = collectBarCharts(slide, rect, counter);
     const blocks = [
-      ...collectShapes(slide, rect, counter),
-      ...collectTextBlocks(slide, rect, counter),
-      ...collectLists(slide, rect, counter),
-      ...collectTables(slide, rect, counter),
-      ...collectImages(slide, rect, counter),
-      ...collectSvgElements(slide, rect, counter),
-      ...collectConicGradients(slide, rect, counter)
+      ...barCharts.blocks,
+      ...collectShapes(slide, rect, counter, barCharts.excludedElements),
+      ...collectTextBlocks(slide, rect, counter, barCharts.excludedElements),
+      ...collectMixedTextBlocks(slide, rect, counter, barCharts.excludedElements),
+      ...collectLists(slide, rect, counter, barCharts.excludedElements),
+      ...collectTables(slide, rect, counter, barCharts.excludedElements),
+      ...collectImages(slide, rect, counter, barCharts.excludedElements),
+      ...collectSvgElements(slide, rect, counter, barCharts.excludedElements),
+      ...collectConicGradients(slide, rect, counter, barCharts.excludedElements)
     ];
     blocks.sort((a, b) => a.order - b.order);
     return {
@@ -776,11 +1558,17 @@ class TableCell:
     border_width: Optional[float] = None
     text_style: Dict[str, Any] = field(default_factory=dict)
     vertical_align: Optional[str] = None
+    runs: List[TextRun] = field(default_factory=list)
+    is_header: bool = False
+    padding_left: Optional[float] = None
+    padding_right: Optional[float] = None
+    padding_top: Optional[float] = None
+    padding_bottom: Optional[float] = None
 
 
 @dataclass
 class Block:
-    kind: str  # text, list, table, image, shape, polyline, circle, ellipse
+    kind: str  # text, list, table, image, shape, polyline, circle, ellipse, bar-chart
     text: str = ""
     runs: List[TextRun] = field(default_factory=list)
     items: List[str] = field(default_factory=list)
@@ -807,8 +1595,13 @@ class SlideModel:
     canvas_width: float = SLIDE_REF_WIDTH
     canvas_height: float = SLIDE_REF_HEIGHT
     scale: Optional[float] = None
+    scale_x: Optional[float] = None
+    scale_y: Optional[float] = None
     offset_x: float = 0.0
     offset_y: float = 0.0
+    transform_mode: str = "contain"
+    raster_image_data_url: Optional[str] = None
+    raster_reason: Optional[str] = None
 
 
 @dataclass
@@ -868,7 +1661,7 @@ def register_layout_constraints(
                     kind=display,
                     parent_style=dict(style),
                     parent_tag=parent,
-                    depth=compute_dom_depth(parent),
+                    depth=resolver.dom_depth(parent),
                 )
                 constraints[key] = constraint
             direct_child = find_direct_child_for_parent(element, parent)
@@ -1053,6 +1846,7 @@ def px_to_pt(px: float) -> float:
     return float(px) * 0.75
 
 
+@lru_cache(maxsize=1024)
 def css_color_to_rgb_tuple(color_str: Optional[str]) -> Optional[Tuple[int, int, int]]:
     if not color_str:
         return None
@@ -1071,20 +1865,27 @@ def css_color_to_rgb_tuple(color_str: Optional[str]) -> Optional[Tuple[int, int,
         if s.lower().startswith("rgb"):
             nums = s[s.find("(") + 1 : s.find(")")].split(",")
             r, g, b = [int(float(v.strip())) for v in nums[:3]]
+            alpha = float(nums[3].strip()) if len(nums) >= 4 else 1.0
+            if alpha < 1.0:
+                r = int(round(r * alpha + 255 * (1.0 - alpha)))
+                g = int(round(g * alpha + 255 * (1.0 - alpha)))
+                b = int(round(b * alpha + 255 * (1.0 - alpha)))
             return (r, g, b)
     except Exception:
         return None
     keyword = CSS_COLOR_KEYWORDS.get(s.lower())
     if keyword:
         return keyword
-    if ImageColor:
+    _, image_color = ensure_pillow()
+    if image_color:
         try:
-            return tuple(ImageColor.getrgb(s))
+            return tuple(image_color.getrgb(s))
         except Exception:
             return None
     return None
 
 
+@lru_cache(maxsize=1024)
 def css_is_transparent(color_str: Optional[str]) -> bool:
     if not color_str:
         return True
@@ -1112,6 +1913,14 @@ def parse_length(value: Optional[str], reference: Optional[float] = None) -> Opt
         return None
     if s.endswith("px"):
         return float(s[:-2])
+    if s.endswith("pt"):
+        return float(s[:-2]) * (96.0 / 72.0)
+    if s.endswith("in"):
+        return float(s[:-2]) * 96.0
+    if s.endswith("cm"):
+        return float(s[:-2]) * (96.0 / 2.54)
+    if s.endswith("mm"):
+        return float(s[:-2]) * (96.0 / 25.4)
     if s.endswith("%") and reference is not None:
         try:
             return float(s[:-1]) / 100.0 * reference
@@ -1162,19 +1971,52 @@ def parse_font_size(value: Optional[str], tag: Optional[str] = None) -> float:
     return DEFAULT_FONT_SIZE
 
 
-def map_font_family(family: Optional[str]) -> Optional[str]:
+def split_font_family_list(family: Optional[str]) -> List[str]:
     if not family:
-        return None
-    base = family.split(",")[0].strip().strip("'\"").lower()
-    return FONT_MAPPING.get(base)
+        return []
+    parts = []
+    for part in family.split(","):
+        normalized = part.strip().strip("'\"")
+        if normalized:
+            parts.append(normalized)
+    return parts
+
+
+def resolve_font_family_name(family: Optional[str]) -> Optional[str]:
+    for name in split_font_family_list(family):
+        lowered = name.lower()
+        if lowered in GENERIC_FONT_MAPPING:
+            continue
+        return name
+    for name in split_font_family_list(family):
+        mapped = GENERIC_FONT_MAPPING.get(name.lower())
+        if mapped:
+            return mapped
+    return None
 
 
 def normalize_whitespace(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text).strip()
 
 
-def parse_declarations(text: str) -> Dict[str, str]:
-    result: Dict[str, str] = {}
+def apply_text_transform(text: str, transform: Optional[str]) -> str:
+    if not text:
+        return text
+    normalized = (transform or "").strip().lower()
+    if normalized in {"", "none"}:
+        return text
+    if normalized == "uppercase":
+        return text.upper()
+    if normalized == "lowercase":
+        return text.lower()
+    if normalized == "capitalize":
+        return re.sub(r"(^|[\s\u3000])(\S)", lambda m: f"{m.group(1)}{m.group(2).upper()}", text)
+    return text
+
+
+@lru_cache(maxsize=2048)
+def _parse_declarations_cached(text: str) -> Tuple[Tuple[str, str], ...]:
+    result: List[Tuple[str, str]] = []
     for part in text.split(";"):
         if ":" not in part:
             continue
@@ -1182,8 +2024,12 @@ def parse_declarations(text: str) -> Dict[str, str]:
         name = name.strip().lower()
         if not name:
             continue
-        result[name] = val.strip()
-    return result
+        result.append((name, val.strip()))
+    return tuple(result)
+
+
+def parse_declarations(text: str) -> Dict[str, str]:
+    return dict(_parse_declarations_cached(text or ""))
 
 
 @dataclass
@@ -1192,14 +2038,18 @@ class StyleRule:
     element_id: Optional[str]
     classes: Tuple[str, ...]
     declarations: Dict[str, str]
+    order: int = 0
+    class_lookup: frozenset[str] = field(init=False, repr=False)
 
-    def matches(self, tag: str, classes: Iterable[str], element_id: Optional[str]) -> bool:
-        class_set = set(classes or [])
+    def __post_init__(self) -> None:
+        self.class_lookup = frozenset(self.classes)
+
+    def matches(self, tag: str, class_set: frozenset[str], element_id: Optional[str]) -> bool:
         if self.tag and self.tag != "*" and self.tag != tag:
             return False
         if self.element_id and self.element_id != element_id:
             return False
-        if self.classes and not set(self.classes).issubset(class_set):
+        if self.class_lookup and not self.class_lookup.issubset(class_set):
             return False
         return True
 
@@ -1231,8 +2081,25 @@ class StyleResolver:
 
     def __init__(self, soup: BeautifulSoup):
         self.rules: List[StyleRule] = []
+        self.rules_by_tag: Dict[str, List[StyleRule]] = {}
+        self.rules_by_class: Dict[str, List[StyleRule]] = {}
+        self.rules_by_id: Dict[str, List[StyleRule]] = {}
+        self.universal_rules: List[StyleRule] = []
+        self._style_cache: Dict[int, Dict[str, str]] = {}
+        self._depth_cache: Dict[int, int] = {}
+        self._rule_order = 0
         for style_tag in soup.select("style"):
             self._consume_stylesheet(style_tag.string or "")
+
+    def _index_rule(self, rule: StyleRule) -> None:
+        if not rule.tag or rule.tag == "*":
+            self.universal_rules.append(rule)
+        else:
+            self.rules_by_tag.setdefault(rule.tag, []).append(rule)
+        if rule.element_id:
+            self.rules_by_id.setdefault(rule.element_id, []).append(rule)
+        for cls in rule.classes:
+            self.rules_by_class.setdefault(cls, []).append(rule)
 
     def _consume_stylesheet(self, css_text: str) -> None:
         cleaned = CSS_COMMENT_RE.sub("", css_text)
@@ -1248,19 +2115,60 @@ class StyleResolver:
                 if not rule:
                     continue
                 rule.declarations = declarations.copy()
+                rule.order = self._rule_order
+                self._rule_order += 1
                 self.rules.append(rule)
+                self._index_rule(rule)
+
+    def dom_depth(self, element: Tag) -> int:
+        cache_key = id(element)
+        cached = self._depth_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        depth = 0
+        current = element
+        while isinstance(current, Tag):
+            parent = current.parent
+            if not isinstance(parent, Tag):
+                break
+            depth += 1
+            current = parent
+        self._depth_cache[cache_key] = depth
+        return depth
 
     def get_style(self, element: Tag) -> Dict[str, str]:
+        cache_key = id(element)
+        cached = self._style_cache.get(cache_key)
+        if cached is not None:
+            return cached
         tag = (element.name or "").lower()
-        classes = element.get("class", [])
+        classes = tuple(element.get("class", []) or [])
+        class_set = frozenset(classes)
         element_id = element.get("id")
+        candidates: List[StyleRule] = []
+        seen_rules = set()
+        candidate_groups: List[Iterable[StyleRule]] = [self.universal_rules]
+        if tag:
+            candidate_groups.append(self.rules_by_tag.get(tag, ()))
+        if element_id:
+            candidate_groups.append(self.rules_by_id.get(element_id, ()))
+        for cls in classes:
+            candidate_groups.append(self.rules_by_class.get(cls, ()))
+        for group in candidate_groups:
+            for rule in group:
+                if rule.order in seen_rules:
+                    continue
+                seen_rules.add(rule.order)
+                candidates.append(rule)
+        candidates.sort(key=lambda rule: rule.order)
         style: Dict[str, str] = {}
-        for rule in self.rules:
-            if rule.matches(tag, classes, element_id):
+        for rule in candidates:
+            if rule.matches(tag, class_set, element_id):
                 style.update(rule.declarations)
         inline = element.get("style")
         if inline:
             style.update(parse_declarations(inline))
+        self._style_cache[cache_key] = style
         return style
 
 
@@ -1289,6 +2197,12 @@ def build_text_style(tag: str, style: Dict[str, str]) -> Dict[str, Any]:
         result["letter_spacing"] = style.get("letter-spacing")
     if style.get("text-transform"):
         result["text_transform"] = style.get("text-transform")
+    if style.get("white-space"):
+        result["white_space"] = style.get("white-space")
+    for side in ("left", "right", "top", "bottom"):
+        padding = parse_length(style.get(f"padding-{side}"))
+        if padding is not None:
+            result[f"padding_{side}"] = padding
     return result
 
 
@@ -1334,6 +2248,12 @@ def apply_text_style(base: Dict[str, Any], style: Dict[str, str], tag: Optional[
         new_style["letter_spacing"] = style.get("letter-spacing")
     if style.get("text-transform"):
         new_style["text_transform"] = style.get("text-transform")
+    if style.get("white-space"):
+        new_style["white_space"] = style.get("white-space")
+    for side in ("left", "right", "top", "bottom"):
+        padding = parse_length(style.get(f"padding-{side}"))
+        if padding is not None:
+            new_style[f"padding_{side}"] = padding
     if tag in {"strong", "b"}:
         new_style["bold"] = True
     if tag in {"em", "i"}:
@@ -1386,13 +2306,15 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
             text = str(node)
             normalized = WHITESPACE_RE.sub(" ", text)
             if normalized.strip():
+                transformed = apply_text_transform(normalized, current_style.get("text_transform"))
                 runs.append(
                     TextRun(
-                        text=normalized,
+                        text=transformed,
                         font_size=current_style.get("font_size"),
                         bold=current_style.get("bold"),
                         italic=current_style.get("italic"),
                         color=current_style.get("color"),
+                        font_family=current_style.get("font_family"),
                     )
                 )
             return
@@ -1419,13 +2341,15 @@ def extract_text_runs(element: Tag, resolver: StyleResolver, base_style: Dict[st
     if not runs:
         text = normalize_whitespace(element.get_text(" ", strip=True))
         if text:
+            transformed = apply_text_transform(text, base_style.get("text_transform"))
             runs.append(
                 TextRun(
-                    text=text,
+                    text=transformed,
                     font_size=base_style.get("font_size"),
                     bold=base_style.get("bold"),
                     italic=base_style.get("italic"),
                     color=base_style.get("color"),
+                    font_family=base_style.get("font_family"),
                 )
             )
     return merge_runs(runs)
@@ -1444,14 +2368,24 @@ def detect_shape_style(style: Dict[str, str]) -> Dict[str, Any]:
             elif token.startswith("#") or token.startswith("rgb"):
                 border_color = token
     border_radius = parse_length(style.get("border-radius"))
-    if not any([fill_color, border_color, border_width, border_radius]):
+    side_info: Dict[str, Any] = {}
+    for side in ("top", "right", "bottom", "left"):
+        side_width = parse_length(style.get(f"border-{side}-width"))
+        side_color = style.get(f"border-{side}-color")
+        if side_width is not None:
+            side_info[f"border_{side}_width"] = side_width
+        if side_color:
+            side_info[f"border_{side}_color"] = side_color
+    if not any([fill_color, border_color, border_width, border_radius, side_info]):
         return {}
-    return {
+    result = {
         "fill_color": fill_color,
         "border_color": border_color,
         "border_width": border_width,
         "border_radius": border_radius,
     }
+    result.update(side_info)
+    return result
 
 
 def parse_z_index(style: Dict[str, str]) -> int:
@@ -1466,26 +2400,162 @@ def parse_z_index(style: Dict[str, str]) -> int:
 
 def has_block_children(element: Tag) -> bool:
     block_tags = {"p", "div", "section", "article", "ul", "ol", "table", "h1", "h2", "h3", "h4", "figure"}
-    for child in element.find_all(block_tags, recursive=False):
-        if child is not None:
+    for child in element.children:
+        if isinstance(child, Tag) and (child.name or "").lower() in block_tags:
             return True
     return False
 
 
-def resolve_image_path(src: str, base_dir: Path) -> Optional[Path]:
+def normalize_image_source(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme == "file":
+        path_value = url2pathname(unquote(parsed.path or ""))
+        if parsed.netloc:
+            path_value = f"/{parsed.netloc}{path_value}"
+        return path_value
+    if parsed.scheme in {"http", "https"}:
+        return unquote(parsed.path or raw)
+    return unquote(raw)
+
+
+def image_map_lookup_keys(src: str) -> List[str]:
+    raw = (src or "").strip()
+    if not raw:
+        return []
+    normalized = normalize_image_source(raw)
+    candidates: List[str] = []
+    for candidate in (
+        raw,
+        normalized,
+        Path(normalized).name if normalized else "",
+        Path(raw).name if raw else "",
+    ):
+        candidate = candidate.strip()
+        if candidate:
+            candidates.append(candidate)
+            candidates.append(candidate.casefold())
+    unique: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def build_image_map(entries: Optional[List[Tuple[str, str]]]) -> ImageMap:
+    mapping: ImageMap = {}
+    for key, mapped_path in entries or []:
+        for alias in image_map_lookup_keys(key):
+            mapping[alias] = mapped_path
+    return mapping
+
+
+def resolve_image_mapping(src: str, image_map: Optional[ImageMap]) -> Optional[str]:
+    if not src or not image_map:
+        return None
+    for key in image_map_lookup_keys(src):
+        mapped = image_map.get(key)
+        if mapped:
+            return mapped
+    return None
+
+
+def resolve_image_path(src: str, base_dir: Path, image_map: Optional[ImageMap] = None) -> Optional[Path]:
     if not src:
         return None
-    parsed = re.match(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*):", src)
-    if parsed:
-        scheme = parsed.group("scheme").lower()
-        if scheme in {"http", "https"}:
-            return None  # Remote resources are not fetched.
-        if scheme == "file":
-            return Path(src.split("://", 1)[-1])
-        if scheme == "data":
+    raw = resolve_image_mapping(src, image_map) or src.strip()
+    parsed = urlparse(raw)
+    cleaned = raw
+    if parsed.scheme:
+        scheme = parsed.scheme.lower()
+        if scheme in {"http", "https", "data"}:
             return None
-    candidate = (base_dir / src).resolve()
-    return candidate if candidate.exists() else None
+        if scheme == "file":
+            path_value = url2pathname(unquote(parsed.path or ""))
+            if parsed.netloc:
+                path_value = f"/{parsed.netloc}{path_value}"
+            cleaned = path_value
+    else:
+        cleaned = unquote(raw)
+
+    path_candidates: List[Path] = []
+    candidate_path = Path(cleaned).expanduser()
+    if candidate_path.is_absolute():
+        path_candidates.append(candidate_path)
+    else:
+        path_candidates.extend(
+            [
+                base_dir / candidate_path,
+                Path.cwd() / candidate_path,
+                base_dir / "assets" / candidate_path,
+                base_dir / "images" / candidate_path,
+                Path.cwd() / "assets" / candidate_path,
+                Path.cwd() / "images" / candidate_path,
+            ]
+        )
+
+    file_name = candidate_path.name or Path(cleaned).name
+    if file_name:
+        downloads_dir = Path.home() / "Downloads"
+        path_candidates.append(downloads_dir / file_name)
+        if "." not in file_name:
+            for parent in (base_dir, base_dir / "assets", base_dir / "images", downloads_dir):
+                if not parent.exists() or not parent.is_dir():
+                    continue
+                matches = sorted(parent.glob(f"{file_name}.*"))
+                path_candidates.extend(matches[:3])
+
+    seen: set[str] = set()
+    for candidate in path_candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists() and resolved.is_file():
+            return resolved
+    return None
+
+
+def format_image_label(src: str) -> str:
+    if not src:
+        return "[画像]"
+    parsed = urlparse(src)
+    if parsed.scheme == "data":
+        return "[埋め込み画像]"
+    name = ""
+    if parsed.scheme == "file":
+        path_value = url2pathname(unquote(parsed.path or ""))
+        name = Path(path_value).name
+    elif parsed.scheme in {"http", "https"}:
+        name = Path(unquote(parsed.path or "")).name
+    else:
+        name = Path(unquote(src)).name
+    name = name or src.strip()
+    return f"[画像] {name}" if name else "[画像]"
+
+
+@lru_cache(maxsize=128)
+def decode_data_url_image(data_url: str) -> Optional[bytes]:
+    if not data_url.startswith("data:"):
+        return None
+    header, sep, payload = data_url.partition(",")
+    if not sep:
+        return None
+    try:
+        if ";base64" in header:
+            return base64.b64decode(payload)
+        return unquote(payload).encode("utf-8")
+    except Exception:
+        return None
 
 
 def element_text(element: Tag) -> str:
@@ -1497,6 +2567,7 @@ def extract_blocks(
     resolver: StyleResolver,
     base_dir: Path,
     constraints_map: Dict[int, LayoutConstraint],
+    image_map: Optional[ImageMap] = None,
 ) -> List[Block]:
     blocks: List[Block] = []
     order_counter = 0
@@ -1550,6 +2621,8 @@ def extract_blocks(
                             border_width=parse_length(cell_style.get("border-width")),
                             text_style=cell_text_style,
                             vertical_align=cell_style.get("vertical-align"),
+                            runs=extract_text_runs(cell, resolver, cell_text_style),
+                            is_header=cell.name == "th",
                         )
                     )
                 if row:
@@ -1560,11 +2633,12 @@ def extract_blocks(
 
         elif tag == "img":
             src = element.get("src")
-            img_path = resolve_image_path(src, base_dir) if src else None
+            mapped_src = resolve_image_mapping(src or "", image_map) or src or ""
+            img_path = resolve_image_path(src, base_dir, image_map=image_map) if src else None
             block = Block(
                 kind="image",
                 image_path=img_path,
-                image_alt=element.get("alt", ""),
+                image_alt=element.get("alt", "") or format_image_label(mapped_src),
                 layout=layout,
             )
 
@@ -1613,6 +2687,8 @@ def estimate_block_height(block: Block) -> float:
         return 240
     if block.kind == "shape":
         return 120
+    if block.kind == "bar-chart":
+        return 260
     return DEFAULT_BLOCK_HEIGHT
 
 
@@ -1725,6 +2801,48 @@ def apply_flex_constraint(constraint: LayoutConstraint, slots: List[LayoutSlot])
             left += width_per + col_gap
 
 
+def is_footer_text_block(block: Block, slide_width: float, slide_height: float) -> bool:
+    if block.kind != "text":
+        return False
+    top = block.layout.top or 0.0
+    left = block.layout.left or 0.0
+    width = block.layout.width or 0.0
+    height = block.layout.height or 0.0
+    if height <= 0 or width <= 0:
+        return False
+    if top < slide_height * 0.88 or height > 28:
+        return False
+    right = left + width
+    if left <= slide_width * 0.3 or right >= slide_width * 0.7:
+        return True
+    text = block.text.strip().lower()
+    return text.startswith("page ") or "contact" in text or text.startswith("©")
+
+
+def resolve_bottom_text_overlaps(slide: SlideModel) -> None:
+    width = slide.canvas_width or SLIDE_REF_WIDTH
+    height = slide.canvas_height or SLIDE_REF_HEIGHT
+    footers = [block for block in slide.blocks if is_footer_text_block(block, width, height)]
+    if not footers:
+        return
+    footer_top = min((block.layout.top or 0.0) for block in footers)
+    safe_gap = 6.0
+    for block in slide.blocks:
+        if block.kind != "text" or block in footers:
+            continue
+        if (block.text_style or {}).get("align") != "center":
+            continue
+        block_top = block.layout.top or 0.0
+        block_height = block.layout.height or estimate_block_height(block)
+        block_width = block.layout.width or 0.0
+        if block_top < height * 0.75 or block_width < width * 0.45:
+            continue
+        block_bottom = block_top + block_height
+        if block_bottom <= footer_top - safe_gap:
+            continue
+        block.layout.top = max(DEFAULT_PADDING_Y, footer_top - block_height - safe_gap)
+
+
 def fit_slide_content(slide: SlideModel) -> None:
     if not slide.blocks:
         return
@@ -1764,6 +2882,7 @@ def fit_slide_content(slide: SlideModel) -> None:
     if max_right > width - DEFAULT_PADDING_X + 5 or max_bottom > height - DEFAULT_PADDING_Y + 5:
         needs_fit = True
     if not needs_fit:
+        resolve_bottom_text_overlaps(slide)
         return
     if scale <= 0:
         scale = 1.0
@@ -1776,9 +2895,10 @@ def fit_slide_content(slide: SlideModel) -> None:
         block.layout.top = DEFAULT_PADDING_Y + (top - min_top) * scale
         block.layout.width = width_px * scale
         block.layout.height = height_px * scale
+    resolve_bottom_text_overlaps(slide)
 
 
-def parse_html_static(input_html: str) -> List[SlideModel]:
+def parse_html_static(input_html: str, image_map: Optional[ImageMap] = None) -> List[SlideModel]:
     path = Path(input_html)
     base_dir = path.parent
     with path.open("r", encoding="utf-8") as f:
@@ -1799,7 +2919,7 @@ def parse_html_static(input_html: str) -> List[SlideModel]:
         title_el = slide_el.find(["h1", "h2", "h3", "h4"])
         title = title_el.get_text(" ", strip=True) if title_el else None
         constraints_map: Dict[int, LayoutConstraint] = {}
-        blocks = extract_blocks(slide_el, resolver, base_dir, constraints_map)
+        blocks = extract_blocks(slide_el, resolver, base_dir, constraints_map, image_map=image_map)
         constraints = sorted(constraints_map.values(), key=lambda c: c.depth)
         canvas_width = (
             parse_length(slide_el.get("width")) or parse_length(style.get("width")) or SLIDE_REF_WIDTH
@@ -1827,7 +2947,11 @@ def parse_html_static(input_html: str) -> List[SlideModel]:
     return slides
 
 
-def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Optional[Block]:
+def browser_block_to_model(
+    block_info: Dict[str, Any],
+    base_dir: Path,
+    image_map: Optional[ImageMap] = None,
+) -> Optional[Block]:
     kind = block_info.get("kind")
     rect = block_info.get("rect") or {}
     layout = LayoutBox(
@@ -1852,10 +2976,18 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         block.text = text
         block.text_style = {
             "font_size": base_font_size,
+            "line_height": float(styles.get("lineHeightPx") or 0) or None,
             "bold": base_bold,
             "italic": base_italic,
             "color": base_color,
             "align": align,
+            "font_family": styles.get("fontFamily"),
+            "text_transform": styles.get("textTransform"),
+            "white_space": styles.get("whiteSpace"),
+            "padding_left": float(styles.get("paddingLeft") or 0),
+            "padding_right": float(styles.get("paddingRight") or 0),
+            "padding_top": float(styles.get("paddingTop") or 0),
+            "padding_bottom": float(styles.get("paddingBottom") or 0),
         }
         run_entries = block_info.get("runs") or []
         runs: List[TextRun] = []
@@ -1876,13 +3008,21 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                     bold=run_bold,
                     italic=run_italic,
                     color=run_color,
+                    font_family=entry.get("fontFamily") or styles.get("fontFamily"),
                 )
             )
         if runs:
             block.runs = runs
         else:
             block.runs = [
-                TextRun(text=text, font_size=base_font_size, bold=base_bold, italic=base_italic, color=base_color)
+                TextRun(
+                    text=text,
+                    font_size=base_font_size,
+                    bold=base_bold,
+                    italic=base_italic,
+                    color=base_color,
+                    font_family=styles.get("fontFamily"),
+                )
             ]
     elif kind == "list":
         items = block_info.get("items") or []
@@ -1902,10 +3042,80 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         block.numbered = bool(block_info.get("ordered"))
         block.text_style = {
             "font_size": font_size,
+            "line_height": float(styles.get("lineHeightPx") or 0) or None,
             "bold": bold,
+            "italic": (styles.get("fontStyle") or "").lower() == "italic",
             "color": color,
             "align": align,
+            "font_family": styles.get("fontFamily"),
+            "text_transform": styles.get("textTransform"),
+            "white_space": styles.get("whiteSpace"),
+            "padding_left": float(styles.get("paddingLeft") or 0),
+            "padding_right": float(styles.get("paddingRight") or 0),
+            "padding_top": float(styles.get("paddingTop") or 0),
+            "padding_bottom": float(styles.get("paddingBottom") or 0),
         }
+        item_meta_entries = block_info.get("itemMeta") or []
+        if item_meta_entries:
+            items_meta: List[Dict[str, Any]] = []
+            for item_entry in item_meta_entries:
+                item_styles = item_entry.get("styles") or {}
+                item_runs: List[TextRun] = []
+                for run_info in item_entry.get("runs") or []:
+                    run_text = run_info.get("text", "")
+                    if not run_text:
+                        continue
+                    item_runs.append(
+                        TextRun(
+                            text=run_text,
+                            font_size=float(
+                                run_info.get("fontSizePx")
+                                or item_styles.get("fontSizePx")
+                                or block.text_style["font_size"]
+                            ),
+                            bold=css_weight_is_bold(run_info.get("fontWeight"))
+                            if run_info.get("fontWeight") is not None
+                            else css_weight_is_bold(item_styles.get("fontWeight")),
+                            italic=(run_info.get("fontStyle") or "").lower() == "italic"
+                            if run_info.get("fontStyle") is not None
+                            else ((item_styles.get("fontStyle") or "").lower() == "italic"),
+                            color=run_info.get("color") or item_styles.get("color") or color,
+                            font_family=run_info.get("fontFamily")
+                            or item_styles.get("fontFamily")
+                            or styles.get("fontFamily"),
+                        )
+                    )
+                items_meta.append(
+                    {
+                        "text": item_entry.get("text", ""),
+                        "rect": item_entry.get("rect") or {},
+                        "style": {
+                            "font_size": float(item_styles.get("fontSizePx") or font_size),
+                            "line_height": float(item_styles.get("lineHeightPx") or 0) or None,
+                        "bold": css_weight_is_bold(item_styles.get("fontWeight")),
+                        "italic": (item_styles.get("fontStyle") or "").lower() == "italic",
+                        "color": item_styles.get("color") or color,
+                        "align": (item_styles.get("textAlign") or "").lower() or align,
+                        "font_family": item_styles.get("fontFamily") or styles.get("fontFamily"),
+                        "text_transform": item_styles.get("textTransform"),
+                        "white_space": item_styles.get("whiteSpace"),
+                        "padding_left": float(item_styles.get("paddingLeft") or 0),
+                        "padding_right": float(item_styles.get("paddingRight") or 0),
+                        "padding_top": float(item_styles.get("paddingTop") or 0),
+                        "padding_bottom": float(item_styles.get("paddingBottom") or 0),
+                    },
+                        "runs": item_runs,
+                    }
+                )
+            block.vector_data = {
+                "items_meta": items_meta,
+                "padding_left": float(styles.get("paddingLeft") or 0),
+                "padding_right": float(styles.get("paddingRight") or 0),
+                "padding_top": float(styles.get("paddingTop") or 0),
+                "padding_bottom": float(styles.get("paddingBottom") or 0),
+                "list_style_type": styles.get("listStyleType"),
+                "list_style_position": styles.get("listStylePosition"),
+            }
     elif kind == "table":
         rows = block_info.get("rows") or []
         if not rows:
@@ -1913,7 +3123,9 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
         block.table = rows
         block.text_style = {
             "font_size": float(styles.get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7),
+            "line_height": float(styles.get("lineHeightPx") or 0) or None,
             "color": styles.get("color"),
+            "font_family": styles.get("fontFamily"),
         }
         row_cells_info = block_info.get("rowCells") or []
         table_cells: List[List[TableCell]] = []
@@ -1921,11 +3133,37 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             cell_objs: List[TableCell] = []
             for cell_info in row:
                 cell_styles = cell_info.get("styles") or {}
+                cell_runs: List[TextRun] = []
+                for run_info in cell_info.get("runs") or []:
+                    run_text = run_info.get("text", "")
+                    if not run_text:
+                        continue
+                    cell_runs.append(
+                        TextRun(
+                            text=run_text,
+                            font_size=float(
+                                run_info.get("fontSizePx")
+                                or cell_styles.get("fontSizePx")
+                                or block.text_style["font_size"]
+                            ),
+                            bold=css_weight_is_bold(run_info.get("fontWeight"))
+                            if run_info.get("fontWeight") is not None
+                            else css_weight_is_bold(cell_styles.get("fontWeight")),
+                            italic=(run_info.get("fontStyle") or "").lower() == "italic"
+                            if run_info.get("fontStyle") is not None
+                            else None,
+                            color=run_info.get("color") or cell_styles.get("color"),
+                            font_family=run_info.get("fontFamily") or cell_styles.get("fontFamily"),
+                        )
+                    )
                 text_style = {
                     "font_size": float(cell_styles.get("fontSizePx") or block.text_style["font_size"]),
+                    "line_height": float(cell_styles.get("lineHeightPx") or 0) or None,
                     "bold": css_weight_is_bold(cell_styles.get("fontWeight")),
+                    "italic": (cell_styles.get("fontStyle") or "").lower() == "italic",
                     "color": cell_styles.get("color"),
                     "align": (cell_styles.get("textAlign") or "").lower() or None,
+                    "font_family": cell_styles.get("fontFamily"),
                 }
                 cell_objs.append(
                     TableCell(
@@ -1935,16 +3173,35 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
                         border_width=float(cell_styles.get("borderWidth") or 0),
                         text_style=text_style,
                         vertical_align=(cell_styles.get("verticalAlign") or "").lower() or None,
+                        runs=cell_runs,
+                        is_header=bool(cell_info.get("isHeader")),
+                        padding_left=float(cell_styles.get("paddingLeft") or 0),
+                        padding_right=float(cell_styles.get("paddingRight") or 0),
+                        padding_top=float(cell_styles.get("paddingTop") or 0),
+                        padding_bottom=float(cell_styles.get("paddingBottom") or 0),
                     )
                 )
             table_cells.append(cell_objs)
         if table_cells:
             block.table_cells = table_cells
+        block.vector_data = {
+            "column_widths": block_info.get("columnWidths") or [],
+            "row_heights": block_info.get("rowHeights") or [],
+        }
     elif kind == "image":
         src = block_info.get("src")
         if src:
-            block.image_path = resolve_image_path(src, base_dir)
-            block.image_alt = src
+            mapped_src = resolve_image_mapping(src, image_map) or src
+            block.image_path = resolve_image_path(src, base_dir, image_map=image_map)
+            block.image_alt = block_info.get("alt") or format_image_label(mapped_src)
+        data_url = block_info.get("dataUrl")
+        if data_url:
+            block.vector_data["data_url"] = data_url
+        if block_info.get("naturalWidth") and block_info.get("naturalHeight"):
+            block.vector_data["natural_size"] = (
+                float(block_info["naturalWidth"]),
+                float(block_info["naturalHeight"]),
+            )
     elif kind == "shape":
         shape = block_info.get("shape") or {}
         block.shape_style = {
@@ -1952,7 +3209,32 @@ def browser_block_to_model(block_info: Dict[str, Any], base_dir: Path) -> Option
             "border_color": shape.get("borderColor"),
             "border_width": shape.get("borderWidth"),
             "border_radius": shape.get("borderRadius"),
+            "is_ellipse": bool(shape.get("isEllipse")),
+            "border_top_width": shape.get("borderTopWidth"),
+            "border_right_width": shape.get("borderRightWidth"),
+            "border_bottom_width": shape.get("borderBottomWidth"),
+            "border_left_width": shape.get("borderLeftWidth"),
+            "border_top_color": shape.get("borderTopColor"),
+            "border_right_color": shape.get("borderRightColor"),
+            "border_bottom_color": shape.get("borderBottomColor"),
+            "border_left_color": shape.get("borderLeftColor"),
         }
+    elif kind == "bar-chart":
+        chart = block_info.get("chart") or {}
+        rows = chart.get("rows") or []
+        if not rows:
+            return None
+        block.kind = "bar-chart"
+        block.text_style = {
+            "font_size": float((chart.get("labelStyles") or {}).get("fontSizePx") or DEFAULT_FONT_SIZE * 0.7),
+            "line_height": float((chart.get("labelStyles") or {}).get("lineHeightPx") or 0) or None,
+            "bold": css_weight_is_bold((chart.get("labelStyles") or {}).get("fontWeight")),
+            "italic": ((chart.get("labelStyles") or {}).get("fontStyle") or "").lower() == "italic",
+            "color": (chart.get("labelStyles") or {}).get("color"),
+            "align": ((chart.get("labelStyles") or {}).get("textAlign") or "").lower() or None,
+            "font_family": (chart.get("labelStyles") or {}).get("fontFamily"),
+        }
+        block.vector_data = chart
     elif kind == "conic-gradient":
         gradient = block_info.get("gradient") or {}
         segments = gradient.get("segments") or []
@@ -1997,12 +3279,15 @@ def parse_html_browser(
     viewport_w: int,
     viewport_h: int,
     dpi_scale: int,
+    image_map: Optional[ImageMap] = None,
+    rasterize_slides: str = "auto",
 ) -> List[SlideModel]:
-    if sync_playwright is None:
+    playwright_factory = ensure_playwright()
+    if playwright_factory is None:
         raise RuntimeError("playwright がインストールされていません。pip install playwright を実行してください。")
     uri = file_or_url_to_uri(input_html)
     slides_data: List[Dict[str, Any]] = []
-    with sync_playwright() as pw:
+    with playwright_factory() as pw:
         browser = pw.chromium.launch()
         ctx = browser.new_context(
             viewport={"width": viewport_w, "height": viewport_h},
@@ -2010,7 +3295,20 @@ def parse_html_browser(
         )
         page = ctx.new_page()
         page.goto(uri, wait_until="load")
+        page.wait_for_timeout(150)
         slides_data = page.evaluate(BROWSER_COLLECT_JS, {"selector": selector})
+        matched_slide_indexes = page.locator(selector).evaluate_all(
+            """
+            (elements) =>
+              elements
+                .map((element, index) => ({
+                  index,
+                  visible: element.offsetWidth > 0 && element.offsetHeight > 0
+                }))
+                .filter((item) => item.visible)
+                .map((item) => item.index)
+            """
+        )
         ctx.close()
         browser.close()
     slides: List[SlideModel] = []
@@ -2029,15 +3327,45 @@ def parse_html_browser(
             canvas_height=canvas_h,
         )
         for block_info in info.get("blocks", []):
-            block = browser_block_to_model(block_info, base_dir)
+            block = browser_block_to_model(block_info, base_dir, image_map=image_map)
             if block:
                 slide.blocks.append(block)
         slides.append(slide)
+    target_indices = resolve_rasterize_slide_targets(rasterize_slides, slides)
+    if target_indices:
+        with playwright_factory() as pw:
+            browser = pw.chromium.launch()
+            ctx = browser.new_context(
+                viewport={"width": viewport_w, "height": viewport_h},
+                device_scale_factor=dpi_scale,
+            )
+            page = ctx.new_page()
+            page.goto(uri, wait_until="load")
+            page.wait_for_timeout(150)
+            if matched_slide_indexes:
+                slide_locator = page.locator(selector)
+                for slide_index, reason in sorted(target_indices.items()):
+                    if slide_index < 0 or slide_index >= len(matched_slide_indexes) or slide_index >= len(slides):
+                        continue
+                    image_bytes = slide_locator.nth(matched_slide_indexes[slide_index]).screenshot(
+                        type="png",
+                        animations="disabled",
+                    )
+                    slides[slide_index].raster_image_data_url = encode_png_data_url(image_bytes)
+                    slides[slide_index].raster_reason = reason
+            elif slides and 0 in target_indices:
+                image_bytes = page.locator("body").screenshot(type="png", animations="disabled")
+                slides[0].raster_image_data_url = encode_png_data_url(image_bytes)
+                slides[0].raster_reason = target_indices[0]
+            ctx.close()
+            browser.close()
+    for slide in slides:
+        resolve_bottom_text_overlaps(slide)
     return slides
 
 
 def ensure_slide_transform(slide_model: SlideModel, prs: Presentation) -> None:
-    if slide_model.scale:
+    if slide_model.scale_x is not None and slide_model.scale_y is not None:
         return
     canvas_width = slide_model.canvas_width or SLIDE_REF_WIDTH
     canvas_height = slide_model.canvas_height or SLIDE_REF_HEIGHT
@@ -2047,23 +3375,32 @@ def ensure_slide_transform(slide_model: SlideModel, prs: Presentation) -> None:
         canvas_height = SLIDE_REF_HEIGHT
     scale_x = prs.slide_width / canvas_width
     scale_y = prs.slide_height / canvas_height
+    if slide_model.transform_mode == "fill":
+        slide_model.scale_x = scale_x or 1.0
+        slide_model.scale_y = scale_y or 1.0
+        slide_model.scale = min(slide_model.scale_x, slide_model.scale_y)
+        slide_model.offset_x = 0.0
+        slide_model.offset_y = 0.0
+        return
     scale = min(scale_x, scale_y)
     if scale <= 0:
         scale = scale_x or scale_y or 1.0
     slide_model.scale = scale
+    slide_model.scale_x = scale
+    slide_model.scale_y = scale
     slide_model.offset_x = (prs.slide_width - canvas_width * scale) / 2
     slide_model.offset_y = (prs.slide_height - canvas_height * scale) / 2
 
 
 def length_to_emu(value_px: float, axis: str, prs: Presentation, slide_model: SlideModel) -> int:
     ensure_slide_transform(slide_model, prs)
-    scale = slide_model.scale or 1.0
+    scale = (slide_model.scale_x if axis == "x" else slide_model.scale_y) or slide_model.scale or 1.0
     return int(max(value_px, 0.0) * scale)
 
 
 def position_to_emu(value_px: float, axis: str, prs: Presentation, slide_model: SlideModel) -> int:
     ensure_slide_transform(slide_model, prs)
-    scale = slide_model.scale or 1.0
+    scale = (slide_model.scale_x if axis == "x" else slide_model.scale_y) or slide_model.scale or 1.0
     base = slide_model.offset_x if axis == "x" else slide_model.offset_y
     return int(base + value_px * scale)
 
@@ -2073,52 +3410,235 @@ def apply_paragraph_alignment(paragraph, align: Optional[str]) -> None:
         return
     align_map = {
         "left": PP_ALIGN.LEFT,
+        "start": PP_ALIGN.LEFT,
         "center": PP_ALIGN.CENTER,
         "right": PP_ALIGN.RIGHT,
+        "end": PP_ALIGN.RIGHT,
         "justify": PP_ALIGN.JUSTIFY,
     }
     paragraph.alignment = align_map.get(align, PP_ALIGN.LEFT)
 
 
-def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
-    left = position_to_emu(block.layout.left or DEFAULT_PADDING_X, "x", prs, slide_model)
-    top = position_to_emu(block.layout.top or DEFAULT_PADDING_Y, "y", prs, slide_model)
-    fallback_width = max((slide_model.canvas_width or SLIDE_REF_WIDTH) - 2 * DEFAULT_PADDING_X, 200.0)
-    width = length_to_emu(block.layout.width or fallback_width, "x", prs, slide_model)
-    height = length_to_emu(block.layout.height or estimate_block_height(block), "y", prs, slide_model)
-    box = slide.shapes.add_textbox(left, top, width, height)
-    tf = box.text_frame
-    tf.word_wrap = True
-    tf.clear()
-    base_style = block.text_style or {}
-    runs = block.runs or [
+def set_font_typeface(font, family: str) -> None:
+    try:
+        r_pr = font._element
+    except Exception:
+        return
+    for tag in ("a:latin", "a:ea", "a:cs"):
+        child = r_pr.find(qn(tag))
+        if child is None:
+            child = OxmlElement(tag)
+            r_pr.append(child)
+        child.set("typeface", family)
+
+
+def apply_font_style(font, style: Dict[str, Any]) -> None:
+    size = style.get("font_size")
+    if size is not None:
+        font.size = Pt(px_to_pt(size))
+    if style.get("bold") is not None:
+        font.bold = bool(style["bold"])
+    if style.get("italic") is not None:
+        font.italic = bool(style["italic"])
+    color = style.get("color")
+    rgb = css_color_to_rgb_tuple(color)
+    if rgb:
+        font.color.rgb = RGBColor(*rgb)
+    family = style.get("font_family")
+    if family:
+        resolved_family = resolve_font_family_name(family) or family.split(",")[0].strip().strip("'\"")
+        font.name = resolved_family
+        set_font_typeface(font, resolved_family)
+
+
+def reset_paragraph_spacing(paragraph) -> None:
+    paragraph.space_before = Pt(0)
+    paragraph.space_after = Pt(0)
+
+
+def apply_paragraph_style(paragraph, style: Dict[str, Any]) -> None:
+    apply_paragraph_alignment(paragraph, style.get("align"))
+    reset_paragraph_spacing(paragraph)
+    line_height = style.get("line_height")
+    if line_height:
+        try:
+            paragraph.line_spacing = Pt(px_to_pt(line_height))
+        except Exception:
+            pass
+
+
+def set_text_frame_padding(text_frame, left: int = 0, right: int = 0, top: int = 0, bottom: int = 0) -> None:
+    text_frame.margin_left = left
+    text_frame.margin_right = right
+    text_frame.margin_top = top
+    text_frame.margin_bottom = bottom
+
+
+def margin_from_padding_px(padding_px: Optional[float], default_pt: float) -> int:
+    if padding_px is None or padding_px <= 0:
+        return Pt(default_pt)
+    return Pt(max(0.0, px_to_pt(padding_px)))
+
+
+def apply_text_frame_box_model(text_frame, style: Dict[str, Any], default_pt: float = 0.0) -> None:
+    set_text_frame_padding(
+        text_frame,
+        margin_from_padding_px(style.get("padding_left"), default_pt),
+        margin_from_padding_px(style.get("padding_right"), default_pt),
+        margin_from_padding_px(style.get("padding_top"), default_pt),
+        margin_from_padding_px(style.get("padding_bottom"), default_pt),
+    )
+    white_space = (style.get("white_space") or "").strip().lower()
+    text_frame.word_wrap = white_space not in {"nowrap", "pre"}
+
+
+def populate_text_frame(text_frame, runs: List[TextRun], base_style: Dict[str, Any], default_text: str = "") -> None:
+    existing_wrap = text_frame.word_wrap
+    text_frame.clear()
+    if existing_wrap is not None:
+        text_frame.word_wrap = existing_wrap
+    normalized_runs = runs or [
         TextRun(
-            text=block.text,
+            text=default_text,
             font_size=base_style.get("font_size"),
             bold=base_style.get("bold"),
             italic=base_style.get("italic"),
             color=base_style.get("color"),
+            font_family=base_style.get("font_family"),
         )
     ]
-    paragraph = tf.paragraphs[0]
-    apply_paragraph_alignment(paragraph, base_style.get("align"))
-    for run in runs:
+    paragraph = text_frame.paragraphs[0]
+    apply_paragraph_style(paragraph, base_style)
+    for run in normalized_runs:
         pieces = run.text.split("\n")
         for idx, piece in enumerate(pieces):
             if idx > 0:
-                paragraph = tf.add_paragraph()
-                apply_paragraph_alignment(paragraph, base_style.get("align"))
+                paragraph = text_frame.add_paragraph()
+                apply_paragraph_style(paragraph, base_style)
             ppt_run = paragraph.add_run()
             ppt_run.text = piece
-            font = ppt_run.font
-            size = run.font_size or base_style.get("font_size") or DEFAULT_FONT_SIZE
-            font.size = Pt(px_to_pt(size))
-            font.bold = run.bold if run.bold is not None else base_style.get("bold")
-            font.italic = run.italic if run.italic is not None else base_style.get("italic")
-            color = run.color or base_style.get("color")
-            rgb = css_color_to_rgb_tuple(color)
-            if rgb:
-                font.color.rgb = RGBColor(*rgb)
+            run_style = dict(base_style)
+            if run.font_size is not None:
+                run_style["font_size"] = run.font_size
+            if run.bold is not None:
+                run_style["bold"] = run.bold
+            if run.italic is not None:
+                run_style["italic"] = run.italic
+            if run.color is not None:
+                run_style["color"] = run.color
+            if run.font_family is not None:
+                run_style["font_family"] = run.font_family
+            apply_font_style(ppt_run.font, run_style)
+
+
+def clone_text_runs(runs: List[TextRun]) -> List[TextRun]:
+    return [
+        TextRun(
+            text=run.text,
+            font_size=run.font_size,
+            bold=run.bold,
+            italic=run.italic,
+            color=run.color,
+            font_family=run.font_family,
+        )
+        for run in runs
+    ]
+
+
+def prepend_prefix_to_runs(runs: List[TextRun], prefix: str, base_style: Dict[str, Any]) -> List[TextRun]:
+    if not prefix:
+        return clone_text_runs(runs)
+    prepared = clone_text_runs(runs)
+    if prepared:
+        first = prepared[0]
+        prepared[0] = TextRun(
+            text=prefix + first.text,
+            font_size=first.font_size,
+            bold=first.bold,
+            italic=first.italic,
+            color=first.color,
+            font_family=first.font_family,
+        )
+        return prepared
+    return [
+        TextRun(
+            text=prefix,
+            font_size=base_style.get("font_size"),
+            bold=base_style.get("bold"),
+            italic=base_style.get("italic"),
+            color=base_style.get("color"),
+            font_family=base_style.get("font_family"),
+        )
+    ]
+
+
+def fit_relative_lengths(total: int, sizes: List[float], count: int) -> List[int]:
+    if count <= 0:
+        return []
+    normalized = [max(float(size or 0), 0.0) for size in sizes[:count]]
+    if len(normalized) < count:
+        normalized.extend([0.0] * (count - len(normalized)))
+    if not any(normalized):
+        normalized = [1.0] * count
+    overall = sum(normalized) or float(count)
+    boundaries = [0]
+    cumulative = 0.0
+    for idx in range(count - 1):
+        cumulative += normalized[idx]
+        boundaries.append(int(round(total * cumulative / overall)))
+    boundaries.append(total)
+    lengths = [max(1, boundaries[idx + 1] - boundaries[idx]) for idx in range(count)]
+    diff = total - sum(lengths)
+    lengths[-1] += diff
+    return lengths
+
+
+def add_border_line(slide, x1: float, y1: float, x2: float, y2: float, color: str, width_px: float, prs, slide_model) -> None:
+    rgb = css_color_to_rgb_tuple(color)
+    if not rgb or width_px <= 0:
+        return
+    connector = slide.shapes.add_connector(
+        MSO_CONNECTOR.STRAIGHT,
+        position_to_emu(x1, "x", prs, slide_model),
+        position_to_emu(y1, "y", prs, slide_model),
+        position_to_emu(x2, "x", prs, slide_model),
+        position_to_emu(y2, "y", prs, slide_model),
+    )
+    connector.line.color.rgb = RGBColor(*rgb)
+    connector.line.width = Pt(px_to_pt(width_px))
+
+
+def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
+    fallback_width = max((slide_model.canvas_width or SLIDE_REF_WIDTH) - 2 * DEFAULT_PADDING_X, 200.0)
+    left_px = block.layout.left or DEFAULT_PADDING_X
+    top_px = block.layout.top or DEFAULT_PADDING_Y
+    width_px = block.layout.width or fallback_width
+    if (
+        not block.shape_style
+        and len(block.text.strip()) <= 64
+        and (block.layout.height or 0) <= 90
+        and width_px <= (slide_model.canvas_width or SLIDE_REF_WIDTH) * 0.7
+    ):
+        extra_ratio = 0.18 if len(block.text.strip()) <= 48 else 0.12
+        extra_width = width_px * extra_ratio
+        max_right = slide_model.canvas_width or SLIDE_REF_WIDTH
+        if left_px + width_px + extra_width <= max_right:
+            width_px += extra_width
+    left = position_to_emu(left_px, "x", prs, slide_model)
+    top = position_to_emu(top_px, "y", prs, slide_model)
+    width = length_to_emu(width_px, "x", prs, slide_model)
+    height = length_to_emu(block.layout.height or estimate_block_height(block), "y", prs, slide_model)
+    box = slide.shapes.add_textbox(left, top, width, height)
+    base_style = block.text_style or {}
+    apply_text_frame_box_model(box.text_frame, base_style)
+    populate_text_frame(box.text_frame, block.runs, base_style, default_text=block.text)
+    if (
+        (base_style.get("white_space") or "").strip().lower() not in {"nowrap", "pre"}
+        and "\n" not in block.text
+        and len(block.text.strip()) <= 32
+        and (block.layout.height or 0) <= 70
+    ):
+        box.text_frame.word_wrap = False
     if block.shape_style:
         shape_style = block.shape_style
         fill_color = css_color_to_rgb_tuple(shape_style.get("fill_color"))
@@ -2136,6 +3656,35 @@ def add_text_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
 
 
 def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
+    base_style = block.text_style or {}
+    item_meta = block.vector_data.get("items_meta") or []
+    list_style_type = (block.vector_data.get("list_style_type") or "").lower()
+    if item_meta:
+        show_bullet = not block.numbered and list_style_type not in {"none", ""}
+        for idx, item in enumerate(item_meta):
+            rect = item.get("rect") or {}
+            item_style = dict(base_style)
+            item_style.update({k: v for k, v in (item.get("style") or {}).items() if v is not None})
+            item_runs = item.get("runs") or []
+            prefix = f"{idx + 1}. " if block.numbered else ("• " if show_bullet else "")
+            prepared_runs = prepend_prefix_to_runs(item_runs, prefix, item_style)
+            default_text = prefix + (item.get("text") or "").strip()
+            left_px = (block.layout.left or DEFAULT_PADDING_X) + float(rect.get("x") or 0.0)
+            top_px = (block.layout.top or DEFAULT_PADDING_Y) + float(rect.get("y") or 0.0)
+            width_px = float(rect.get("w") or block.layout.width or 200.0)
+            height_px = float(rect.get("h") or estimate_block_height(block))
+            box = slide.shapes.add_textbox(
+                position_to_emu(left_px, "x", prs, slide_model),
+                position_to_emu(top_px, "y", prs, slide_model),
+                length_to_emu(width_px, "x", prs, slide_model),
+                length_to_emu(height_px, "y", prs, slide_model),
+            )
+            tf = box.text_frame
+            apply_text_frame_box_model(tf, item_style)
+            populate_text_frame(tf, prepared_runs, item_style, default_text=default_text)
+            box.fill.background()
+            box.line.fill.background()
+        return
     left = position_to_emu(
         block.layout.left or DEFAULT_PADDING_X + DEFAULT_LIST_INDENT, "x", prs, slide_model
     )
@@ -2148,26 +3697,18 @@ def add_list_block(slide, block: Block, prs: Presentation, slide_model: SlideMod
     height = length_to_emu(block.layout.height or estimate_block_height(block), "y", prs, slide_model)
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
-    tf.word_wrap = True
+    apply_text_frame_box_model(tf, base_style)
     tf.clear()
-    base_style = block.text_style or {}
     for idx, item in enumerate(block.items):
         paragraph = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         text = item.strip()
         if block.numbered:
             text = f"{idx + 1}. {text}"
+        else:
+            text = f"• {text}"
         paragraph.text = text
-        apply_paragraph_alignment(paragraph, base_style.get("align"))
-        font = paragraph.font
-        size = base_style.get("font_size", DEFAULT_FONT_SIZE)
-        font.size = Pt(px_to_pt(size))
-        if base_style.get("bold") is not None:
-            font.bold = bool(base_style["bold"])
-        if base_style.get("italic") is not None:
-            font.italic = bool(base_style["italic"])
-        rgb = css_color_to_rgb_tuple(base_style.get("color"))
-        if rgb:
-            font.color.rgb = RGBColor(*rgb)
+        apply_paragraph_style(paragraph, base_style)
+        apply_font_style(paragraph.font, {"font_size": base_style.get("font_size", DEFAULT_FONT_SIZE), **base_style})
 
 
 def apply_cell_border(cell, color: Optional[str], width_px: float) -> None:
@@ -2212,10 +3753,12 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
     cols = max(len(r) for r in block.table)
     table_shape = slide.shapes.add_table(rows, cols, left, top, width, height)
     table = table_shape.table
+    column_widths = fit_relative_lengths(width, block.vector_data.get("column_widths") or [], cols)
+    row_heights = fit_relative_lengths(height, block.vector_data.get("row_heights") or [], rows)
     for c in range(cols):
-        table.columns[c].width = width // cols
+        table.columns[c].width = column_widths[c]
     for r in range(rows):
-        table.rows[r].height = height // rows
+        table.rows[r].height = row_heights[r]
     base_style = block.text_style or {}
     for r, row in enumerate(block.table):
         for c, value in enumerate(row):
@@ -2228,26 +3771,26 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
             text_value = value
             if cell_info and cell_info.text:
                 text_value = cell_info.text
-            cell.text = text_value
             tf = cell.text_frame
-            tf.word_wrap = True
-            paragraph = tf.paragraphs[0]
             style = dict(base_style)
             if cell_info:
                 cell_style = cell_info.text_style or {}
                 style.update({k: v for k, v in cell_style.items() if v is not None})
-            apply_paragraph_alignment(paragraph, style.get("align"))
-            font = paragraph.font
-            size = style.get("font_size", DEFAULT_FONT_SIZE)
-            font.size = Pt(px_to_pt(size))
-            if style.get("bold") is not None:
-                font.bold = bool(style["bold"])
-            if style.get("italic") is not None:
-                font.italic = bool(style["italic"])
-            color = style.get("color")
-            rgb = css_color_to_rgb_tuple(color)
-            if rgb:
-                font.color.rgb = RGBColor(*rgb)
+            if cell_info and cell_info.is_header and style.get("bold") is None:
+                style["bold"] = True
+            cell.margin_left = margin_from_padding_px(cell_info.padding_left if cell_info else None, 6)
+            cell.margin_right = margin_from_padding_px(cell_info.padding_right if cell_info else None, 6)
+            cell.margin_top = margin_from_padding_px(cell_info.padding_top if cell_info else None, 3)
+            cell.margin_bottom = margin_from_padding_px(cell_info.padding_bottom if cell_info else None, 3)
+            if cell_info and cell_info.vertical_align:
+                vertical_align = cell_info.vertical_align
+                if vertical_align in {"middle", "center"}:
+                    cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+                elif vertical_align == "bottom":
+                    cell.vertical_anchor = MSO_ANCHOR.BOTTOM
+                else:
+                    cell.vertical_anchor = MSO_ANCHOR.TOP
+            populate_text_frame(tf, cell_info.runs if cell_info else [], style, default_text=text_value)
             if cell_info:
                 bg = cell_info.background_color
                 if bg and not css_is_transparent(bg):
@@ -2261,13 +3804,51 @@ def add_table_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
                     apply_cell_border(cell, cell_info.border_color, cell_info.border_width or 1.0)
 
 
+def add_rasterized_slide_block(slide, slide_model: SlideModel, prs: Presentation) -> bool:
+    if not slide_model.raster_image_data_url:
+        return False
+    image_bytes = decode_data_url_image(slide_model.raster_image_data_url)
+    if not image_bytes:
+        return False
+    ensure_slide_transform(slide_model, prs)
+    left = position_to_emu(0, "x", prs, slide_model)
+    top = position_to_emu(0, "y", prs, slide_model)
+    width = length_to_emu(slide_model.canvas_width or SLIDE_REF_WIDTH, "x", prs, slide_model)
+    height = length_to_emu(slide_model.canvas_height or SLIDE_REF_HEIGHT, "y", prs, slide_model)
+    slide.shapes.add_picture(io.BytesIO(image_bytes), left, top, width=width, height=height)
+    return True
+
+
+@lru_cache(maxsize=256)
+def _read_image_size(image_path: str) -> Optional[Tuple[int, int]]:
+    image_module, _ = ensure_pillow()
+    if not image_module:
+        return None
+    try:
+        with image_module.open(image_path) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def _read_image_size_from_bytes(image_bytes: bytes) -> Optional[Tuple[int, int]]:
+    image_module, _ = ensure_pillow()
+    if not image_module:
+        return None
+    try:
+        with image_module.open(io.BytesIO(image_bytes)) as img:
+            return img.size
+    except Exception:
+        return None
+
+
 def resolve_image_size(block: Block) -> Tuple[float, float]:
     width = block.layout.width or 640
     height = block.layout.height or 360
-    if block.image_path and Image:
-        try:
-            with Image.open(block.image_path) as img:
-                natural_w, natural_h = img.size
+    if block.image_path:
+        natural_size = _read_image_size(str(block.image_path))
+        if natural_size:
+            natural_w, natural_h = natural_size
             if block.layout.width and block.layout.height:
                 return block.layout.width, block.layout.height
             if block.layout.width and not block.layout.height:
@@ -2277,8 +3858,31 @@ def resolve_image_size(block: Block) -> Tuple[float, float]:
                 ratio = block.layout.height / natural_h
                 return natural_w * ratio, block.layout.height
             return natural_w, natural_h
-        except Exception:
-            return width, height
+    if block.vector_data:
+        natural_size = block.vector_data.get("natural_size")
+        if natural_size:
+            natural_w, natural_h = natural_size
+            if block.layout.width and not block.layout.height:
+                ratio = block.layout.width / natural_w
+                return block.layout.width, natural_h * ratio
+            if block.layout.height and not block.layout.width:
+                ratio = block.layout.height / natural_h
+                return natural_w * ratio, block.layout.height
+        data_url = block.vector_data.get("data_url")
+        if data_url:
+            image_bytes = decode_data_url_image(data_url)
+            if image_bytes:
+                loaded_size = _read_image_size_from_bytes(image_bytes)
+                if loaded_size:
+                    natural_w, natural_h = loaded_size
+                    if block.layout.width and not block.layout.height:
+                        ratio = block.layout.width / natural_w
+                        return block.layout.width, natural_h * ratio
+                    if block.layout.height and not block.layout.width:
+                        ratio = block.layout.height / natural_h
+                        return natural_w * ratio, block.layout.height
+                    if not block.layout.width and not block.layout.height:
+                        return natural_w, natural_h
     return width, height
 
 
@@ -2288,15 +3892,29 @@ def add_image_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
     top = position_to_emu(block.layout.top or DEFAULT_PADDING_Y, "y", prs, slide_model)
     width = length_to_emu(width_px, "x", prs, slide_model)
     height = length_to_emu(height_px, "y", prs, slide_model)
+    image_bytes = decode_data_url_image(block.vector_data.get("data_url", "")) if block.vector_data else None
     if block.image_path and block.image_path.exists():
         slide.shapes.add_picture(str(block.image_path), left, top, width=width, height=height)
+    elif image_bytes:
+        slide.shapes.add_picture(io.BytesIO(image_bytes), left, top, width=width, height=height)
     else:
         placeholder = slide.shapes.add_textbox(left, top, width, height)
         tf = placeholder.text_frame
-        tf.text = block.image_alt or "[画像]"
-        paragraph = tf.paragraphs[0]
-        paragraph.alignment = PP_ALIGN.CENTER
-        paragraph.font.size = Pt(px_to_pt(24))
+        tf.word_wrap = True
+        tf.clear()
+        title = tf.paragraphs[0]
+        title.text = "画像未解決"
+        title.alignment = PP_ALIGN.CENTER
+        reset_paragraph_spacing(title)
+        apply_font_style(title.font, {"font_size": 22, "bold": True, "color": "#666666"})
+        caption = tf.add_paragraph()
+        caption.text = block.image_alt or "[画像]"
+        caption.alignment = PP_ALIGN.CENTER
+        reset_paragraph_spacing(caption)
+        apply_font_style(caption.font, {"font_size": 12, "color": "#888888"})
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        placeholder.fill.solid()
+        placeholder.fill.fore_color.rgb = RGBColor(246, 246, 246)
         placeholder.line.color.rgb = RGBColor(200, 200, 200)
         placeholder.line.width = Pt(px_to_pt(2))
 
@@ -2307,9 +3925,13 @@ def add_shape_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
     width = length_to_emu(block.layout.width or 240, "x", prs, slide_model)
     height = length_to_emu(block.layout.height or 120, "y", prs, slide_model)
     shape_type = (
-        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE
-        if block.shape_style.get("border_radius")
-        else MSO_AUTO_SHAPE_TYPE.RECTANGLE
+        MSO_AUTO_SHAPE_TYPE.OVAL
+        if block.shape_style.get("is_ellipse")
+        else (
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE
+            if block.shape_style.get("border_radius")
+            else MSO_AUTO_SHAPE_TYPE.RECTANGLE
+        )
     )
     shape = slide.shapes.add_shape(shape_type, left, top, width, height)
     fill_color = css_color_to_rgb_tuple(block.shape_style.get("fill_color"))
@@ -2318,13 +3940,183 @@ def add_shape_block(slide, block: Block, prs: Presentation, slide_model: SlideMo
         shape.fill.fore_color.rgb = RGBColor(*fill_color)
     else:
         shape.fill.background()
-    border_color = css_color_to_rgb_tuple(block.shape_style.get("border_color"))
-    if border_color:
-        shape.line.color.rgb = RGBColor(*border_color)
-        width_px = block.shape_style.get("border_width") or 2
-        shape.line.width = Pt(px_to_pt(width_px))
+    border_entries = {}
+    for side in ("top", "right", "bottom", "left"):
+        width_px = float(block.shape_style.get(f"border_{side}_width") or 0.0)
+        color = block.shape_style.get(f"border_{side}_color") or block.shape_style.get("border_color")
+        if width_px > 0 and color and not css_is_transparent(color):
+            border_entries[side] = (width_px, color)
+    if border_entries:
+        unique_borders = {(round(width_px, 3), color) for width_px, color in border_entries.values()}
+        if len(border_entries) == 4 and len(unique_borders) == 1:
+            width_px, color = next(iter(border_entries.values()))
+            border_color = css_color_to_rgb_tuple(color)
+            if border_color:
+                shape.line.color.rgb = RGBColor(*border_color)
+                shape.line.width = Pt(px_to_pt(width_px))
+            else:
+                shape.line.fill.background()
+                shape.line.width = 0
+        else:
+            shape.line.fill.background()
+            shape.line.width = 0
+            x = block.layout.left or DEFAULT_PADDING_X
+            y = block.layout.top or DEFAULT_PADDING_Y
+            w = block.layout.width or 240
+            h = block.layout.height or 120
+            if "top" in border_entries:
+                add_border_line(slide, x, y, x + w, y, border_entries["top"][1], border_entries["top"][0], prs, slide_model)
+            if "right" in border_entries:
+                add_border_line(slide, x + w, y, x + w, y + h, border_entries["right"][1], border_entries["right"][0], prs, slide_model)
+            if "bottom" in border_entries:
+                add_border_line(slide, x, y + h, x + w, y + h, border_entries["bottom"][1], border_entries["bottom"][0], prs, slide_model)
+            if "left" in border_entries:
+                add_border_line(slide, x, y, x, y + h, border_entries["left"][1], border_entries["left"][0], prs, slide_model)
     else:
-        shape.line.fill.background()
+        border_color = css_color_to_rgb_tuple(block.shape_style.get("border_color"))
+        border_width = float(block.shape_style.get("border_width") or 0.0)
+        if border_color and border_width > 0:
+            shape.line.color.rgb = RGBColor(*border_color)
+            width_px = border_width or 2
+            shape.line.width = Pt(px_to_pt(width_px))
+        else:
+            shape.line.fill.background()
+            shape.line.width = 0
+
+
+def add_bar_chart_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
+    chart = block.vector_data or {}
+    rows = chart.get("rows") or []
+    if not rows:
+        return
+    label_style = dict(block.text_style or {})
+    title = chart.get("title") or {}
+    title_text = (title.get("text") or "").strip()
+    if title_text:
+        title_rect = title.get("rect") or {}
+        title_style = title.get("styles") or {}
+        title_box = slide.shapes.add_textbox(
+            position_to_emu((block.layout.left or 0) + float(title_rect.get("x") or 0), "x", prs, slide_model),
+            position_to_emu((block.layout.top or 0) + float(title_rect.get("y") or 0), "y", prs, slide_model),
+            length_to_emu(float(title_rect.get("w") or block.layout.width or 160.0), "x", prs, slide_model),
+            length_to_emu(float(title_rect.get("h") or 18.0), "y", prs, slide_model),
+        )
+        set_text_frame_padding(title_box.text_frame)
+        populate_text_frame(
+            title_box.text_frame,
+            [
+                TextRun(
+                    text=title_text,
+                    font_size=float(title_style.get("fontSizePx") or label_style.get("font_size") or DEFAULT_FONT_SIZE * 0.55),
+                    bold=css_weight_is_bold(title_style.get("fontWeight")),
+                    italic=(title_style.get("fontStyle") or "").lower() == "italic",
+                    color=title_style.get("color"),
+                    font_family=title_style.get("fontFamily"),
+                )
+            ],
+            {
+                "font_size": float(title_style.get("fontSizePx") or label_style.get("font_size") or DEFAULT_FONT_SIZE * 0.55),
+                "bold": css_weight_is_bold(title_style.get("fontWeight")),
+                "italic": (title_style.get("fontStyle") or "").lower() == "italic",
+                "color": title_style.get("color"),
+                "align": (title_style.get("textAlign") or "left").lower(),
+                "font_family": title_style.get("fontFamily"),
+            },
+            default_text=title_text,
+        )
+        title_box.fill.background()
+        title_box.line.fill.background()
+    for row in rows:
+        label_box = slide.shapes.add_textbox(
+            position_to_emu(block.layout.left or 0, "x", prs, slide_model),
+            position_to_emu((block.layout.top or 0) + float((row.get("rowRect") or {}).get("y") or 0), "y", prs, slide_model),
+            length_to_emu(float(chart.get("labelColumnWidth") or 180.0), "x", prs, slide_model),
+            length_to_emu(float((row.get("rowRect") or {}).get("h") or 28.0), "y", prs, slide_model),
+        )
+        set_text_frame_padding(label_box.text_frame)
+        populate_text_frame(
+            label_box.text_frame,
+            [
+                TextRun(
+                    text=row.get("label", ""),
+                    font_size=label_style.get("font_size"),
+                    bold=label_style.get("bold"),
+                    italic=label_style.get("italic"),
+                    color=label_style.get("color"),
+                    font_family=label_style.get("font_family"),
+                )
+            ],
+            {**label_style, "align": "left"},
+            default_text=row.get("label", ""),
+        )
+        label_box.fill.background()
+        label_box.line.fill.background()
+
+        track_rect = row.get("trackRect") or {}
+        fill_style = row.get("fillStyle") or {}
+        track_style = row.get("trackStyle") or {}
+        track_left = (block.layout.left or 0) + float(track_rect.get("x") or 0)
+        track_top = (block.layout.top or 0) + float(track_rect.get("y") or 0)
+        track_width = float(track_rect.get("w") or 0)
+        track_height = float(track_rect.get("h") or 0)
+        if track_width <= 0 or track_height <= 0:
+            continue
+
+        base_track = Block(
+            kind="shape",
+            layout=LayoutBox(left=track_left, top=track_top, width=track_width, height=track_height),
+            shape_style={
+                "fill_color": track_style.get("backgroundColor"),
+                "border_radius": track_style.get("borderRadius"),
+            },
+        )
+        add_shape_block(slide, base_track, prs, slide_model)
+
+        ratio = float(row.get("ratio") or 0.0)
+        fill_width = max(2.0, track_width * max(0.0, min(1.0, ratio)))
+        fill_block = Block(
+            kind="shape",
+            layout=LayoutBox(left=track_left, top=track_top, width=fill_width, height=track_height),
+            shape_style={
+                "fill_color": fill_style.get("backgroundColor"),
+                "border_radius": fill_style.get("borderRadius") or track_style.get("borderRadius"),
+            },
+        )
+        add_shape_block(slide, fill_block, prs, slide_model)
+
+        value_styles = row.get("valueStyles") or {}
+        value_rect = row.get("valueRect") or {}
+        value_box = slide.shapes.add_textbox(
+            position_to_emu((block.layout.left or 0) + float(value_rect.get("x") or 0), "x", prs, slide_model),
+            position_to_emu((block.layout.top or 0) + float(value_rect.get("y") or 0), "y", prs, slide_model),
+            length_to_emu(float(value_rect.get("w") or chart.get("valueColumnWidth") or 80.0), "x", prs, slide_model),
+            length_to_emu(float(value_rect.get("h") or track_height), "y", prs, slide_model),
+        )
+        set_text_frame_padding(value_box.text_frame)
+        populate_text_frame(
+            value_box.text_frame,
+            [
+                TextRun(
+                    text=row.get("valueText", ""),
+                    font_size=float(value_styles.get("fontSizePx") or label_style.get("font_size") or DEFAULT_FONT_SIZE * 0.65),
+                    bold=css_weight_is_bold(value_styles.get("fontWeight")),
+                    italic=(value_styles.get("fontStyle") or "").lower() == "italic",
+                    color=value_styles.get("color"),
+                    font_family=value_styles.get("fontFamily"),
+                )
+            ],
+            {
+                "font_size": float(value_styles.get("fontSizePx") or label_style.get("font_size") or DEFAULT_FONT_SIZE * 0.65),
+                "bold": css_weight_is_bold(value_styles.get("fontWeight")),
+                "italic": (value_styles.get("fontStyle") or "").lower() == "italic",
+                "color": value_styles.get("color"),
+                "align": (value_styles.get("textAlign") or "left").lower(),
+                "font_family": value_styles.get("fontFamily"),
+            },
+            default_text=row.get("valueText", ""),
+        )
+        value_box.fill.background()
+        value_box.line.fill.background()
 
 
 def add_polyline_block(slide, block: Block, prs: Presentation, slide_model: SlideModel) -> None:
@@ -2501,12 +4293,32 @@ def add_conic_gradient_block(slide, block: Block, prs: Presentation, slide_model
         shape.line.fill.background()
 
 
-def slide_model_to_pptx(slides: List[SlideModel], output_path: str) -> None:
+def block_render_priority(block: Block) -> int:
+    if block.kind in {"shape", "conic-gradient", "vector_circle", "vector_ellipse", "vector_polyline"}:
+        return 0
+    if block.kind in {"image", "table"}:
+        return 1
+    if block.kind == "bar-chart":
+        return 2
+    if block.kind in {"text", "list"}:
+        return 3
+    return 4
+
+
+def slide_model_to_pptx(slides: List[SlideModel], output_path: str, page_size: str = "16:9") -> None:
     prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
+    page_width, page_height = PPT_PAGE_SIZES_INCHES.get(page_size, PPT_PAGE_SIZES_INCHES["16:9"])
+    prs.slide_width = Inches(page_width)
+    prs.slide_height = Inches(page_height)
     blank = prs.slide_layouts[6]
+    transform_mode = "fill" if page_size == "a4" else "contain"
     for slide_model in slides:
+        slide_model.scale = None
+        slide_model.scale_x = None
+        slide_model.scale_y = None
+        slide_model.offset_x = 0.0
+        slide_model.offset_y = 0.0
+        slide_model.transform_mode = transform_mode
         slide = prs.slides.add_slide(blank)
         if slide_model.background_color:
             rgb = css_color_to_rgb_tuple(slide_model.background_color)
@@ -2515,7 +4327,9 @@ def slide_model_to_pptx(slides: List[SlideModel], output_path: str) -> None:
                 fill.solid()
                 fill.fore_color.rgb = RGBColor(*rgb)
         ensure_slide_transform(slide_model, prs)
-        ordered_blocks = sorted(slide_model.blocks, key=lambda b: (b.z_index, b.order))
+        if add_rasterized_slide_block(slide, slide_model, prs):
+            continue
+        ordered_blocks = sorted(slide_model.blocks, key=lambda b: (b.z_index, block_render_priority(b), b.order))
         for block in ordered_blocks:
             try:
                 if block.kind == "text":
@@ -2528,6 +4342,8 @@ def slide_model_to_pptx(slides: List[SlideModel], output_path: str) -> None:
                     add_image_block(slide, block, prs, slide_model)
                 elif block.kind == "shape":
                     add_shape_block(slide, block, prs, slide_model)
+                elif block.kind == "bar-chart":
+                    add_bar_chart_block(slide, block, prs, slide_model)
                 elif block.kind == "vector_polyline":
                     add_polyline_block(slide, block, prs, slide_model)
                 elif block.kind == "vector_circle":
@@ -2568,7 +4384,29 @@ def main() -> None:
         default=2,
         help="browser エンジン使用時の device pixel ratio",
     )
+    parser.add_argument(
+        "--page-size",
+        type=normalize_page_size,
+        default="16:9",
+        metavar="16:9|A4",
+        help="出力 PPTX のページサイズ。16:9 または A4（横向き）。",
+    )
+    parser.add_argument(
+        "--image-map",
+        type=parse_image_map_entry,
+        action="append",
+        default=[],
+        metavar="PLACEHOLDER=PATH",
+        help="画像 placeholder を実ファイルにマッピング。例: --image-map IMAGE_URL_1=./assets/hero.png",
+    )
+    parser.add_argument(
+        "--rasterize-slides",
+        default="none",
+        metavar="auto|none|3-6,8",
+        help="browser エンジン時に指定 slide をページ画像として埋め込む。既定は none。auto / none / 1始まりの番号・範囲指定。",
+    )
     args = parser.parse_args()
+    image_map = build_image_map(args.image_map)
 
     input_path = Path(args.input_html)
     if not input_path.exists():
@@ -2593,10 +4431,12 @@ def main() -> None:
                 viewport_w=viewport_w,
                 viewport_h=viewport_h,
                 dpi_scale=args.dpr,
+                image_map=image_map,
+                rasterize_slides=args.rasterize_slides,
             )
         else:
-            slides = parse_html_static(str(input_path))
-        slide_model_to_pptx(slides, args.output_pptx)
+            slides = parse_html_static(str(input_path), image_map=image_map)
+        slide_model_to_pptx(slides, args.output_pptx, page_size=args.page_size)
     except Exception as exc:
         print(f"変換に失敗しました: {exc}", file=sys.stderr)
         sys.exit(3)
