@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+_work/
+output/
+
+*.pptx
+
+/test_*.html
+/test_image.png
+/必*テスト.html

@@ -3,6 +3,8 @@
 `html_ppt.py` converts slide-oriented HTML documents into editable PowerPoint (`.pptx`) decks.  
 The focus is on recreating text, shapes, tables, charts, and images as native PowerPoint objects, keeping fonts, colors, and layout as close as possible to the source HTML/CSS.
 
+This repository currently supports `html_ppt.py` as the primary CLI entrypoint. Older experimental converter scripts were removed from the main tree to keep the repository focused; if you need them, use Git history.
+
 ## Features
 - Parses `.slide`, `.slide-container`, or `[data-slide]` sections as individual slides.
 - Converts headings, paragraphs, lists, and inline styling (color, bold, italics) into editable text boxes.
